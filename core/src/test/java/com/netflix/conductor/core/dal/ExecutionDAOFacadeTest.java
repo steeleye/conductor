@@ -217,7 +217,6 @@ public class ExecutionDAOFacadeTest {
     }
 
     @Test
-<<<<<<< HEAD
     public void testArchiveWorkflowSkipsRemovalOnIndexFailure() throws Exception {
         InputStream stream = TestDeciderService.class.getResourceAsStream("/completed.json");
         WorkflowModel workflow = objectMapper.readValue(stream, WorkflowModel.class);
@@ -282,8 +281,6 @@ public class ExecutionDAOFacadeTest {
     }
 
     @Test
-=======
->>>>>>> upstream/main
     public void testUpdateWorkflowSkipsTaskIndexingWhenDisabled() {
         WorkflowModel workflow = new WorkflowModel();
         WorkflowDef workflowDef = new WorkflowDef();
