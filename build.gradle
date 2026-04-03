@@ -8,7 +8,7 @@ buildscript {
         }
     }
     dependencies {
-        classpath 'org.springframework.boot:spring-boot-gradle-plugin:3.3.11'
+        classpath 'org.springframework.boot:spring-boot-gradle-plugin:3.3.13'
         classpath 'com.diffplug.spotless:spotless-plugin-gradle:6.+'
     }
 }
@@ -21,13 +21,13 @@ plugins {
     id 'signing'
     id 'java-library'
     id "com.diffplug.spotless" version "6.25.0"
-    id 'org.springframework.boot' version '3.3.5'
+    id 'org.springframework.boot' version '3.3.13'
 }
 
 // Establish version and status
 ext.githubProjectName = rootProject.name // Change if github project name is not the same as the root project's name
 
-ext["tomcat.version"] = "10.1.45"
+ext["tomcat.version"] = "10.1.52"
 
 subprojects {
     tasks.withType(Javadoc).all { enabled = false }
@@ -93,7 +93,7 @@ allprojects {
 
     dependencyManagement {
         imports {
-            // dependency versions for the BOM can be found at https://docs.spring.io/spring-boot/docs/3.3.11/reference/htmlsingle/#appendix.dependency-versions
+            // dependency versions for the BOM can be found at https://docs.spring.io/spring-boot/docs/3.3.13/reference/htmlsingle/#appendix.dependency-versions
             mavenBom(SpringBootPlugin.BOM_COORDINATES)
         }
     }
@@ -135,6 +135,9 @@ allprojects {
             }
             implementation('com.microsoft.sqlserver:mssql-jdbc:12.8.2.jre11') {
                 because 'CVE-2025-59250: improper input validation'
+            }
+            implementation('com.github.junrar:junrar:7.5.8') {
+                because 'CVE-2026-28208: patch vulnerable transitive from spring-ai-tika-document-reader'
             }
         }
     }

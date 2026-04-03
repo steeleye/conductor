@@ -12,7 +12,7 @@
  */
 
 // Contains overrides for Spring Boot Dependency Management plugin
-// Dependency version override properties can be found at https://docs.spring.io/spring-boot/docs/3.3.11/reference/htmlsingle/#appendix.dependency-versions.properties
+// Dependency version override properties can be found at https://docs.spring.io/spring-boot/docs/3.3.13/reference/htmlsingle/#appendix.dependency-versions.properties
 
 // Conductor's default is ES6, but SB brings in ES7
 ext['elasticsearch.version'] = revElasticSearch7
@@ -37,3 +37,9 @@ ext['testcontainers.version'] = revTestContainer
 // conductor-redis-api (which declares jedis as 'api'), and without this override the
 // dependency-management plugin would resolve the BOM version instead of 6.0.0.
 ext['jedis.version'] = revJedis
+
+// Security: keep Netty on the latest patched 4.1.x line without leaving Spring Boot 3.3.x.
+ext['netty.version'] = '4.1.132.Final'
+
+// Security: pick up the Log4j2 hostname verification fix on the current 2.x line.
+ext['log4j2.version'] = '2.25.3'
