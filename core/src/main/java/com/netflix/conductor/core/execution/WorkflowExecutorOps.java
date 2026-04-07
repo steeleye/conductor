@@ -49,6 +49,7 @@ import com.netflix.conductor.core.utils.QueueUtils;
 import com.netflix.conductor.core.utils.Utils;
 import com.netflix.conductor.dao.MetadataDAO;
 import com.netflix.conductor.dao.QueueDAO;
+import com.netflix.conductor.dao.WorkflowMessageQueueDAO;
 import com.netflix.conductor.metrics.Monitors;
 import com.netflix.conductor.model.TaskModel;
 import com.netflix.conductor.model.WorkflowModel;
@@ -88,6 +89,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
     private final SystemTaskRegistry systemTaskRegistry;
     private long activeWorkerLastPollMs;
     private final ExecutionLockService executionLockService;
+    private final Optional<WorkflowMessageQueueDAO> workflowMessageQueueDAO;
 
     private final Predicate<PollData> validateLastPolledTime =
             pollData ->
@@ -106,7 +108,8 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             ExecutionLockService executionLockService,
             SystemTaskRegistry systemTaskRegistry,
             ParametersUtils parametersUtils,
-            IDGenerator idGenerator) {
+            IDGenerator idGenerator,
+            Optional<WorkflowMessageQueueDAO> workflowMessageQueueDAO) {
         this.deciderService = deciderService;
         this.metadataDAO = metadataDAO;
         this.queueDAO = queueDAO;
@@ -120,6 +123,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
         this.parametersUtils = parametersUtils;
         this.idGenerator = idGenerator;
         this.systemTaskRegistry = systemTaskRegistry;
+        this.workflowMessageQueueDAO = workflowMessageQueueDAO;
     }
 
     /**
@@ -606,6 +610,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             expediteLazyWorkflowEvaluation(workflow.getParentWorkflowId());
         }
 
+        workflowMessageQueueDAO.ifPresent(dao -> dao.delete(workflow.getWorkflowId()));
         executionLockService.releaseLock(workflow.getWorkflowId());
         executionLockService.deleteLock(workflow.getWorkflowId());
         return workflow;
@@ -757,6 +762,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             executionDAOFacade.removeFromPendingWorkflow(
                     workflow.getWorkflowName(), workflow.getWorkflowId());
 
+            workflowMessageQueueDAO.ifPresent(dao -> dao.delete(workflow.getWorkflowId()));
             return workflow;
         } finally {
             executionLockService.releaseLock(workflow.getWorkflowId());
