@@ -145,27 +145,25 @@ public class RedisExecutionDAO extends BaseDynoDAO
 
             recordRedisDaoRequests("createTask", task.getTaskType(), task.getWorkflowType());
 
+            if (task.getStatus() != null
+                    && !task.getStatus().isTerminal()
+                    && task.getScheduledTime() == 0) {
+                task.setScheduledTime(System.currentTimeMillis());
+            }
+
             String taskKey = task.getReferenceTaskName() + "" + task.getRetryCount();
             Long added =
-                    jedisProxy.hset(
+                    jedisProxy.hsetnx(
                             nsKey(SCHEDULED_TASKS, task.getWorkflowInstanceId()),
                             taskKey,
                             task.getTaskId());
             if (added < 1) {
                 LOGGER.debug(
-                        "Task already scheduled, skipping the run "
-                                + task.getTaskId()
-                                + ", ref="
-                                + task.getReferenceTaskName()
-                                + ", key="
-                                + taskKey);
+                        "Task already scheduled, skipping the run {}, ref={}, key={}",
+                        task.getTaskId(),
+                        task.getReferenceTaskName(),
+                        taskKey);
                 continue;
-            }
-
-            if (task.getStatus() != null
-                    && !task.getStatus().isTerminal()
-                    && task.getScheduledTime() == 0) {
-                task.setScheduledTime(System.currentTimeMillis());
             }
 
             correlateTaskToWorkflowInDS(task.getTaskId(), task.getWorkflowInstanceId());
