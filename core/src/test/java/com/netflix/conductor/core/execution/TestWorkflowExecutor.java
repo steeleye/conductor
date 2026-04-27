@@ -849,9 +849,73 @@ public class TestWorkflowExecutor {
         assertSame(workflow, found);
         verify(executionDAOFacade, never()).createWorkflow(any());
         verify(executionDAOFacade, never()).getWorkflowModel("existing-workflow-id", false);
-        verify(queueDAO, never()).push(anyString(), anyString(), anyInt(), anyLong());
+        verify(queueDAO).push("_deciderQueue", "existing-workflow-id", 10, 0);
         verify(queueDAO, never()).postpone(anyString(), anyString(), anyInt(), anyLong());
         verify(executionLockService).releaseLock("existing-workflow-id");
+    }
+
+    @Test
+    public void testStartWorkflowIdempotentDoesNotQueueExistingTerminalWorkflowModel() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("existing-terminal-workflow");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setVersion(workflowDef.getVersion());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setWorkflowId("existing-terminal-workflow-id");
+
+        WorkflowModel workflow = new WorkflowModel();
+        workflow.setWorkflowId("existing-terminal-workflow-id");
+        workflow.setStatus(WorkflowModel.Status.COMPLETED);
+
+        when(executionLockService.acquireLock("existing-terminal-workflow-id")).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO(
+                        "existing-terminal-workflow-id", false))
+                .thenReturn(workflow);
+
+        WorkflowModel found = workflowExecutor.startWorkflowIdempotent(input);
+
+        assertSame(workflow, found);
+        verify(executionDAOFacade, never()).createWorkflow(any());
+        verify(queueDAO, never()).push(anyString(), anyString(), anyInt(), anyLong());
+        verify(queueDAO, never()).postpone(anyString(), anyString(), anyInt(), anyLong());
+        verify(executionLockService).releaseLock("existing-terminal-workflow-id");
+    }
+
+    @Test(expected = RuntimeException.class)
+    public void testStartWorkflowIdempotentDoesNotRemoveExistingWorkflowWhenQueueRepairFails() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("existing-queue-repair-failure");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setVersion(workflowDef.getVersion());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setWorkflowId("existing-queue-repair-failure-id");
+
+        WorkflowModel workflow = new WorkflowModel();
+        workflow.setWorkflowId("existing-queue-repair-failure-id");
+        workflow.setStatus(WorkflowModel.Status.RUNNING);
+
+        when(executionLockService.acquireLock("existing-queue-repair-failure-id")).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO(
+                        "existing-queue-repair-failure-id", false))
+                .thenReturn(workflow);
+        when(queueDAO.containsMessage("_deciderQueue", "existing-queue-repair-failure-id"))
+                .thenThrow(new RuntimeException("queue unavailable"));
+
+        try {
+            workflowExecutor.startWorkflowIdempotent(input);
+        } finally {
+            verify(executionDAOFacade, never())
+                    .removeWorkflow("existing-queue-repair-failure-id", false);
+            verify(executionLockService).releaseLock("existing-queue-repair-failure-id");
+        }
     }
 
     @Test

@@ -2019,10 +2019,15 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             throw new TransientException("Error acquiring lock when creating workflow: {}");
         }
 
+        boolean existingWorkflowFound = false;
         try {
             try {
                 WorkflowModel existingWorkflow =
                         executionDAOFacade.getWorkflowModelFromExecutionDAO(workflowId, false);
+                existingWorkflowFound = true;
+                if (!existingWorkflow.getStatus().isTerminal()) {
+                    expediteLazyWorkflowEvaluation(existingWorkflow.getWorkflowId());
+                }
                 return existingWorkflow;
             } catch (NotFoundException e) {
                 LOGGER.debug(
@@ -2044,10 +2049,12 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             LOGGER.error(
                     "Unable to start workflow idempotently: {}", workflowDefinition.getName(), e);
 
-            try {
-                executionDAOFacade.removeWorkflow(workflowId, false);
-            } catch (Exception rwe) {
-                LOGGER.error("Could not remove the workflowId: " + workflowId, rwe);
+            if (!existingWorkflowFound) {
+                try {
+                    executionDAOFacade.removeWorkflow(workflowId, false);
+                } catch (Exception rwe) {
+                    LOGGER.error("Could not remove the workflowId: " + workflowId, rwe);
+                }
             }
             throw e;
         } finally {
