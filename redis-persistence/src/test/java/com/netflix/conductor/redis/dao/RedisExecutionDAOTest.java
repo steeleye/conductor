@@ -50,6 +50,9 @@ import static org.junit.Assert.*;
 
 public class RedisExecutionDAOTest extends ExecutionDAOTest {
 
+    private static final String SCHEDULED_TASKS = "SCHEDULED_TASKS";
+    private static final String WORKFLOW_TO_TASKS = "WORKFLOW_TO_TASKS";
+
     private static final GenericContainer<?> redis =
             new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
 
@@ -148,6 +151,116 @@ public class RedisExecutionDAOTest extends ExecutionDAOTest {
         for (int i = 0; i < taskCount; i++) {
             assertEquals(tasks.get(i).getTaskId(), retrievedTasks.get(i).getTaskId());
             assertEquals(tasks.get(i).getTaskDefName(), retrievedTasks.get(i).getTaskDefName());
+        }
+    }
+
+    @Test
+    public void testCreateTasksDoesNotOverwriteExistingScheduledTask() {
+        WorkflowModel workflow = createRunningWorkflow();
+        executionDAO.createWorkflow(workflow);
+
+        TaskModel firstTask =
+                createTask(workflow.getWorkflowId(), "task_type", "duplicate_ref", "task_1");
+        List<TaskModel> created = executionDAO.createTasks(List.of(firstTask));
+        assertEquals(1, created.size());
+
+        TaskModel duplicateTask =
+                createTask(workflow.getWorkflowId(), "task_type", "duplicate_ref", "task_2");
+        created = executionDAO.createTasks(List.of(duplicateTask));
+
+        assertTrue(created.isEmpty());
+        assertNull(executionDAO.getTask(duplicateTask.getTaskId()));
+
+        try (Jedis jedis = jedisPool.getResource()) {
+            assertEquals(
+                    firstTask.getTaskId(),
+                    jedis.hget(
+                            executionDAO.nsKey(SCHEDULED_TASKS, workflow.getWorkflowId()),
+                            "duplicate_ref0"));
+            assertTrue(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            firstTask.getTaskId()));
+            assertFalse(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            duplicateTask.getTaskId()));
+        }
+    }
+
+    @Test
+    public void testCreateTasksReplacesScheduledTaskWithMissingPayload() {
+        WorkflowModel workflow = createRunningWorkflow();
+        executionDAO.createWorkflow(workflow);
+
+        String oldTaskId = "missing_payload_task";
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.hset(
+                    executionDAO.nsKey(SCHEDULED_TASKS, workflow.getWorkflowId()),
+                    "join_ref0",
+                    oldTaskId);
+            jedis.sadd(executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()), oldTaskId);
+        }
+
+        TaskModel replacementTask =
+                createTask(workflow.getWorkflowId(), "JOIN", "join_ref", "replacement_task");
+        List<TaskModel> created = executionDAO.createTasks(List.of(replacementTask));
+
+        assertEquals(1, created.size());
+        assertNotNull(executionDAO.getTask(replacementTask.getTaskId()));
+        try (Jedis jedis = jedisPool.getResource()) {
+            assertEquals(
+                    replacementTask.getTaskId(),
+                    jedis.hget(
+                            executionDAO.nsKey(SCHEDULED_TASKS, workflow.getWorkflowId()),
+                            "join_ref0"));
+            assertFalse(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            oldTaskId));
+            assertTrue(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            replacementTask.getTaskId()));
+        }
+    }
+
+    @Test
+    public void testCreateTasksRepairsMissingWorkflowToTasksMapping() {
+        WorkflowModel workflow = createRunningWorkflow();
+        executionDAO.createWorkflow(workflow);
+
+        TaskModel existingTask =
+                createTask(workflow.getWorkflowId(), "task_type", "repair_ref", "existing_task");
+        List<TaskModel> created = executionDAO.createTasks(List.of(existingTask));
+        assertEquals(1, created.size());
+
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.srem(
+                    executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                    existingTask.getTaskId());
+            assertFalse(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            existingTask.getTaskId()));
+        }
+
+        TaskModel duplicateTask =
+                createTask(workflow.getWorkflowId(), "task_type", "repair_ref", "duplicate_task");
+        created = executionDAO.createTasks(List.of(duplicateTask));
+
+        assertTrue(created.isEmpty());
+        assertNull(executionDAO.getTask(duplicateTask.getTaskId()));
+        try (Jedis jedis = jedisPool.getResource()) {
+            assertEquals(
+                    existingTask.getTaskId(),
+                    jedis.hget(
+                            executionDAO.nsKey(SCHEDULED_TASKS, workflow.getWorkflowId()),
+                            "repair_ref0"));
+            assertTrue(
+                    jedis.sismember(
+                            executionDAO.nsKey(WORKFLOW_TO_TASKS, workflow.getWorkflowId()),
+                            existingTask.getTaskId()));
         }
     }
 
@@ -342,5 +455,17 @@ public class RedisExecutionDAOTest extends ExecutionDAOTest {
         def.setVersion(1);
         workflow.setWorkflowDefinition(def);
         return workflow;
+    }
+
+    private TaskModel createTask(
+            String workflowId, String taskDefName, String referenceTaskName, String taskId) {
+        TaskModel task = new TaskModel();
+        task.setTaskDefName(taskDefName);
+        task.setTaskType(taskDefName);
+        task.setStatus(TaskModel.Status.SCHEDULED);
+        task.setTaskId(taskId);
+        task.setWorkflowInstanceId(workflowId);
+        task.setReferenceTaskName(referenceTaskName);
+        return task;
     }
 }

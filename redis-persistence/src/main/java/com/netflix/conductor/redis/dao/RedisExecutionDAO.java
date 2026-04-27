@@ -60,6 +60,8 @@ public class RedisExecutionDAO extends BaseDynoDAO
     private static final String CORR_ID_TO_WORKFLOWS = "CORR_ID_TO_WORKFLOWS";
     private static final String SUB_WORKFLOW_ID_RESERVATIONS = "SUB_WORKFLOW_ID_RESERVATIONS";
     private static final String EVENT_EXECUTION = "EVENT_EXECUTION";
+    private static final String TASK_CREATE_LOCK = "TASK_CREATE_LOCK";
+    private static final long TASK_CREATE_LOCK_TTL_MILLIS = 30_000;
     private final int ttlEventExecutionSeconds;
 
     public RedisExecutionDAO(
@@ -146,49 +148,226 @@ public class RedisExecutionDAO extends BaseDynoDAO
             recordRedisDaoRequests("createTask", task.getTaskType(), task.getWorkflowType());
 
             String taskKey = task.getReferenceTaskName() + "" + task.getRetryCount();
-            Long added =
-                    jedisProxy.hset(
-                            nsKey(SCHEDULED_TASKS, task.getWorkflowInstanceId()),
-                            taskKey,
-                            task.getTaskId());
-            if (added < 1) {
-                LOGGER.debug(
-                        "Task already scheduled, skipping the run "
-                                + task.getTaskId()
-                                + ", ref="
-                                + task.getReferenceTaskName()
-                                + ", key="
-                                + taskKey);
+            String scheduledTasksKey = nsKey(SCHEDULED_TASKS, task.getWorkflowInstanceId());
+            String lockKey =
+                    nsKey(
+                            TASK_CREATE_LOCK,
+                            task.getWorkflowInstanceId(),
+                            task.getReferenceTaskName(),
+                            String.valueOf(task.getRetryCount()));
+            String lockToken = UUID.randomUUID().toString();
+            if (!acquireTaskCreateLock(lockKey, lockToken)) {
+                LOGGER.warn(
+                        "Task create lock already held, skipping task creation attempt, workflowId={}, ref={}, retry={}, taskId={}, lockKey={}",
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount(),
+                        task.getTaskId(),
+                        lockKey);
                 continue;
             }
 
-            if (task.getStatus() != null
-                    && !task.getStatus().isTerminal()
-                    && task.getScheduledTime() == 0) {
-                task.setScheduledTime(System.currentTimeMillis());
+            try {
+                LOGGER.debug(
+                        "Task create lock acquired, workflowId={}, ref={}, retry={}, taskId={}, lockKey={}",
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount(),
+                        task.getTaskId(),
+                        lockKey);
+
+                Long added = jedisProxy.hsetnx(scheduledTasksKey, taskKey, task.getTaskId());
+                LOGGER.debug(
+                        "Attempted SCHEDULED_TASKS admission, workflowId={}, ref={}, retry={}, taskId={}, taskKey={}, added={}",
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount(),
+                        task.getTaskId(),
+                        taskKey,
+                        added);
+                if (added < 1 && !recoverExistingScheduledTask(task, taskKey, scheduledTasksKey)) {
+                    continue;
+                }
+
+                if (added > 0) {
+                    LOGGER.info(
+                            "Creating task {}, workflowId={}, ref={}, retry={}",
+                            task.getTaskId(),
+                            task.getWorkflowInstanceId(),
+                            task.getReferenceTaskName(),
+                            task.getRetryCount());
+                }
+                LOGGER.debug(
+                        "Scheduled task added to SCHEDULED_TASKS workflowId: {}, taskId: {}, taskType: {} during createTasks",
+                        task.getWorkflowInstanceId(),
+                        task.getTaskId(),
+                        task.getTaskType());
+
+                if (task.getStatus() != null
+                        && !task.getStatus().isTerminal()
+                        && task.getScheduledTime() == 0) {
+                    task.setScheduledTime(System.currentTimeMillis());
+                    LOGGER.debug(
+                            "Scheduled time set during createTasks, workflowId={}, taskId={}, scheduledTime={}",
+                            task.getWorkflowInstanceId(),
+                            task.getTaskId(),
+                            task.getScheduledTime());
+                }
+
+                correlateTaskToWorkflowInDS(task.getTaskId(), task.getWorkflowInstanceId());
+                LOGGER.debug(
+                        "Scheduled task added to WORKFLOW_TO_TASKS workflowId: {}, taskId: {}, taskType: {} during createTasks",
+                        task.getWorkflowInstanceId(),
+                        task.getTaskId(),
+                        task.getTaskType());
+
+                String inProgressTaskKey = nsKey(IN_PROGRESS_TASKS, task.getTaskDefName());
+                jedisProxy.sadd(inProgressTaskKey, task.getTaskId());
+                LOGGER.debug(
+                        "Scheduled task added to IN_PROGRESS_TASKS with inProgressTaskKey: {}, workflowId: {}, taskId: {}, taskType: {} during createTasks",
+                        inProgressTaskKey,
+                        task.getWorkflowInstanceId(),
+                        task.getTaskId(),
+                        task.getTaskType());
+
+                updateTask(task);
+                LOGGER.debug(
+                        "Task payload updated during createTasks, workflowId={}, taskId={}, taskType={}, status={}",
+                        task.getWorkflowInstanceId(),
+                        task.getTaskId(),
+                        task.getTaskType(),
+                        task.getStatus());
+                tasksCreated.add(task);
+            } finally {
+                releaseTaskCreateLock(lockKey, lockToken);
             }
-
-            correlateTaskToWorkflowInDS(task.getTaskId(), task.getWorkflowInstanceId());
-            LOGGER.debug(
-                    "Scheduled task added to WORKFLOW_TO_TASKS workflowId: {}, taskId: {}, taskType: {} during createTasks",
-                    task.getWorkflowInstanceId(),
-                    task.getTaskId(),
-                    task.getTaskType());
-
-            String inProgressTaskKey = nsKey(IN_PROGRESS_TASKS, task.getTaskDefName());
-            jedisProxy.sadd(inProgressTaskKey, task.getTaskId());
-            LOGGER.debug(
-                    "Scheduled task added to IN_PROGRESS_TASKS with inProgressTaskKey: {}, workflowId: {}, taskId: {}, taskType: {} during createTasks",
-                    inProgressTaskKey,
-                    task.getWorkflowInstanceId(),
-                    task.getTaskId(),
-                    task.getTaskType());
-
-            updateTask(task);
-            tasksCreated.add(task);
         }
 
         return tasksCreated;
+    }
+
+    private boolean acquireTaskCreateLock(String lockKey, String lockToken) {
+        return "OK"
+                .equals(
+                        jedisProxy.setWithExpiryInMilliIfNotExists(
+                                lockKey, lockToken, TASK_CREATE_LOCK_TTL_MILLIS));
+    }
+
+    private void releaseTaskCreateLock(String lockKey, String lockToken) {
+        try {
+            String currentToken = jedisProxy.get(lockKey);
+            if (lockToken.equals(currentToken)) {
+                jedisProxy.del(lockKey);
+                LOGGER.debug("Task create lock released, lockKey={}", lockKey);
+            } else {
+                LOGGER.warn(
+                        "Task create lock not released because token changed or expired, lockKey={}, tokenPresent={}",
+                        lockKey,
+                        currentToken != null);
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Unable to release task create lock {}", lockKey, e);
+        }
+    }
+
+    private boolean recoverExistingScheduledTask(
+            TaskModel task, String taskKey, String scheduledTasksKey) {
+        String scheduledTaskId = jedisProxy.hget(scheduledTasksKey, taskKey);
+        LOGGER.debug(
+                "Recovering existing scheduled task, workflowId={}, ref={}, retry={}, replacementTaskId={}, existingTaskId={}",
+                task.getWorkflowInstanceId(),
+                task.getReferenceTaskName(),
+                task.getRetryCount(),
+                task.getTaskId(),
+                scheduledTaskId);
+        if (scheduledTaskId != null) {
+            TaskModel scheduledTask = getTask(scheduledTaskId);
+            if (scheduledTask == null) {
+                LOGGER.warn(
+                        "Replacing scheduled task {} because TASK payload is missing, workflowId={}, ref={}, retry={}",
+                        scheduledTaskId,
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount());
+                cleanupTaskReferences(task, taskKey, scheduledTaskId);
+                jedisProxy.hset(scheduledTasksKey, taskKey, task.getTaskId());
+                LOGGER.warn(
+                        "Scheduled task replaced after missing TASK payload, workflowId={}, ref={}, retry={}, oldTaskId={}, replacementTaskId={}",
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount(),
+                        scheduledTaskId,
+                        task.getTaskId());
+                return true;
+            }
+
+            String workflowToTasksKey = nsKey(WORKFLOW_TO_TASKS, task.getWorkflowInstanceId());
+            if (!jedisProxy.sismember(workflowToTasksKey, scheduledTaskId)) {
+                jedisProxy.sadd(workflowToTasksKey, scheduledTaskId);
+                LOGGER.warn(
+                        "Repaired missing WORKFLOW_TO_TASKS mapping for scheduled task {}, workflowId={}, ref={}, retry={}",
+                        scheduledTaskId,
+                        task.getWorkflowInstanceId(),
+                        task.getReferenceTaskName(),
+                        task.getRetryCount());
+            }
+            LOGGER.warn(
+                    "Task already scheduled, skipping the run {}, workflowId={}, ref={}, retry={}, existingTaskId={}",
+                    task.getTaskId(),
+                    task.getWorkflowInstanceId(),
+                    task.getReferenceTaskName(),
+                    task.getRetryCount(),
+                    scheduledTaskId);
+            return false;
+        }
+
+        LOGGER.warn(
+                "Replacing scheduled task with unresolved id, workflowId={}, ref={}, retry={}",
+                task.getWorkflowInstanceId(),
+                task.getReferenceTaskName(),
+                task.getRetryCount());
+        jedisProxy.hset(scheduledTasksKey, taskKey, task.getTaskId());
+        LOGGER.warn(
+                "Scheduled task replaced after unresolved SCHEDULED_TASKS id, workflowId={}, ref={}, retry={}, replacementTaskId={}",
+                task.getWorkflowInstanceId(),
+                task.getReferenceTaskName(),
+                task.getRetryCount(),
+                task.getTaskId());
+        return true;
+    }
+
+    private void cleanupTaskReferences(TaskModel task, String taskKey, String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return;
+        }
+        try {
+            LOGGER.debug(
+                    "Cleaning up task references before replacement, workflowId={}, ref={}, retry={}, taskId={}",
+                    task.getWorkflowInstanceId(),
+                    task.getReferenceTaskName(),
+                    task.getRetryCount(),
+                    taskId);
+            jedisProxy.hdel(nsKey(SCHEDULED_TASKS, task.getWorkflowInstanceId()), taskKey);
+            jedisProxy.srem(nsKey(WORKFLOW_TO_TASKS, task.getWorkflowInstanceId()), taskId);
+            jedisProxy.srem(nsKey(IN_PROGRESS_TASKS, task.getTaskDefName()), taskId);
+            jedisProxy.srem(nsKey(TASKS_IN_PROGRESS_STATUS, task.getTaskDefName()), taskId);
+            jedisProxy.zrem(nsKey(TASK_LIMIT_BUCKET, task.getTaskDefName()), taskId);
+            jedisProxy.del(nsKey(TASK, taskId));
+            LOGGER.warn(
+                    "Cleaned up task references before replacement, workflowId={}, ref={}, retry={}, taskId={}",
+                    task.getWorkflowInstanceId(),
+                    task.getReferenceTaskName(),
+                    task.getRetryCount(),
+                    taskId);
+        } catch (Exception e) {
+            LOGGER.warn(
+                    "Unable to cleanup task references for task {}, workflowId={}, ref={}, retry={}",
+                    taskId,
+                    task.getWorkflowInstanceId(),
+                    task.getReferenceTaskName(),
+                    task.getRetryCount(),
+                    e);
+        }
     }
 
     @Override
@@ -255,9 +434,8 @@ public class RedisExecutionDAO extends BaseDynoDAO
                     task.getStatus().name());
         }
 
-        Set<String> taskIds =
-                jedisProxy.smembers(nsKey(WORKFLOW_TO_TASKS, task.getWorkflowInstanceId()));
-        if (!taskIds.contains(task.getTaskId())) {
+        if (!jedisProxy.sismember(
+                nsKey(WORKFLOW_TO_TASKS, task.getWorkflowInstanceId()), task.getTaskId())) {
             correlateTaskToWorkflowInDS(task.getTaskId(), task.getWorkflowInstanceId());
         }
     }
