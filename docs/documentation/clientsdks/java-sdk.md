@@ -169,7 +169,7 @@ That's it -- you just defined a worker, built a workflow, and executed it. Open 
 
 ## Comprehensive worker example
 
-See [examples/src/main/java/com/netflix/conductor/sdk/examples/helloworld/](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/com/netflix/conductor/sdk/examples/helloworld/) for a complete working example with:
+See [examples/basics/hello-world/](https://github.com/conductor-oss/java-sdk/tree/main/examples/basics/hello-world) for a complete working example with:
 - Workflow definition using the SDK
 - Worker implementation with annotations
 - Workflow execution and monitoring
@@ -374,13 +374,64 @@ workflowClient.restartWorkflow(workflowId, false);
 
 ---
 
+## File handling
+
+For workflows that move binary file payloads, the SDK exposes `FileHandler` — a worker-facing reference to a file in the configured backend. Pass it as a worker input/output and the runtime handles upload, download, and the metadata roundtrip transparently. See [File Storage](../advanced/file-storage.md) for the operator-side configuration and [File API](../api/files.md) for the underlying REST surface.
+
+The relevant types in `org.conductoross.conductor.sdk.file`:
+
+| Type | Use |
+|---|---|
+| `FileHandler` | Worker parameter type for files. Static `fromLocalFile(Path)` / `fromLocalFile(Path, contentType)` create a handle for a local file the worker is producing. |
+| `FileUploader` | Explicit upload API; obtained from `task.getFileUploader()` inside a `Worker` impl, or from `WorkflowFileClient` outside one. |
+| `FileUploadOptions` | Optional metadata: `contentType`, `fileName`, `taskId`, `multipart`. |
+
+**Worker that consumes a file:**
+
+```java
+public class TranscodeInput {
+    public FileHandler primary_video;
+    public String resolution;
+}
+
+@WorkerTask("transcode_video")
+public @OutputParam("output_file") FileHandler transcode(TranscodeInput input) throws IOException {
+    Path transcoded = Files.createTempFile("transcoded-", ".mp4");
+    try (InputStream in = input.primary_video.getInputStream()) {
+        Files.write(transcoded, in.readAllBytes());
+    }
+    return FileHandler.fromLocalFile(transcoded, "video/mp4");
+}
+```
+
+`primary_video` is auto-resolved from the task input — the runtime downloads the file lazily on first read of `getInputStream()`. The returned `FileHandler` is auto-uploaded by the task runner before the task output is published, and the resulting `fileHandleId` is substituted into the output map so downstream tasks can consume it.
+
+**Explicit upload inside a `Worker` implementation:**
+
+```java
+@Override
+public TaskResult execute(Task task) {
+    Path output = renderReport(task);
+    FileHandler handle = task.getFileUploader().upload(
+            output,
+            new FileUploadOptions().setContentType("application/pdf").setMultipart(true));
+    TaskResult result = new TaskResult(task);
+    result.getOutputData().put("report", handle);
+    return result;
+}
+```
+
+Use this form when you want to control upload timing (e.g., upload before the task's main work completes, or upload an `InputStream` that's not backed by a file). When `multipart=true` the SDK uses the multipart upload flow on backends that support it, falling back to single-shot otherwise.
+
+---
+
 ## AI & LLM Workflows
 
 Conductor supports AI-native workflows including agentic tool calling, RAG pipelines, and multi-agent orchestration.
 
 **Agentic Workflows**
 
-Build AI agents where LLMs dynamically select and call Java workers as tools. All agentic examples live in [`AgenticExamplesRunner.java`](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/agentic/AgenticExamplesRunner.java) — a single unified runner.
+Build AI agents where LLMs dynamically select and call Java workers as tools. All agentic examples live in [`AgenticExamplesRunner.java`](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/agentic/AgenticExamplesRunner.java) — a single unified runner.
 
 | Workflow | Description |
 |----------|-------------|
@@ -394,8 +445,8 @@ Build AI agents where LLMs dynamically select and call Java workers as tools. Al
 
 | Example | Description |
 |---------|-------------|
-| [RagWorkflowExample.java](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/agentic/RagWorkflowExample.java) | End-to-end RAG: document indexing, semantic search, answer generation |
-| [VectorDbExample.java](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/agentic/VectorDbExample.java) | Vector database operations: text indexing, embedding generation, and semantic search |
+| [RagWorkflowExample.java](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/agentic/RagWorkflowExample.java) | End-to-end RAG: document indexing, semantic search, answer generation |
+| [VectorDbExample.java](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/agentic/VectorDbExample.java) | Vector database operations: text indexing, embedding generation, and semantic search |
 
 **Using LLM Tasks in Workflows:**
 
@@ -468,12 +519,13 @@ See the [Examples Guide](https://github.com/conductor-oss/java-sdk/blob/main/exa
 
 | Example | Description | Run |
 |---------|-------------|-----|
-| [Hello World](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/com/netflix/conductor/sdk/examples/helloworld/) | Minimal workflow with worker | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.helloworld.Main` |
-| [Workflow Operations](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/workflowops/) | Pause, resume, terminate workflows | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.workflowops.Main` |
-| [Shipment Workflow](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/com/netflix/conductor/sdk/examples/shipment/) | Real-world order processing | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.shipment.Main` |
-| [Events](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/com/netflix/conductor/sdk/examples/events/) | Event-driven workflows | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.events.EventHandlerExample` |
-| [All AI examples](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/agentic/AgenticExamplesRunner.java) | All agentic/LLM workflows | `./gradlew :examples:run --args="--all"` |
-| [RAG Workflow](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/agentic/RagWorkflowExample.java) | RAG pipeline (index → search → answer) | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.agentic.RagWorkflowExample` |
+| [Hello World](https://github.com/conductor-oss/java-sdk/tree/main/examples/basics/hello-world) | Minimal workflow with worker | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.helloworld.Main` |
+| [Workflow Operations](https://github.com/conductor-oss/java-sdk/tree/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/workflowops) | Pause, resume, terminate workflows | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.workflowops.Main` |
+| [Shipment Workflow](https://github.com/conductor-oss/java-sdk/tree/main/examples/old/src/main/java/com/netflix/conductor/sdk/examples/shipment) | Real-world order processing | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.shipment.Main` |
+| [Events](https://github.com/conductor-oss/java-sdk/tree/main/examples/old/src/main/java/com/netflix/conductor/sdk/examples/events) | Event-driven workflows | `./gradlew :examples:run -PmainClass=com.netflix.conductor.sdk.examples.events.EventHandlerExample` |
+| [All AI examples](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/agentic/AgenticExamplesRunner.java) | All agentic/LLM workflows | `./gradlew :examples:run --args="--all"` |
+| [RAG Workflow](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/agentic/RagWorkflowExample.java) | RAG pipeline (index → search → answer) | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.agentic.RagWorkflowExample` |
+| [Media Transcoder](https://github.com/conductor-oss/file-storage-java-sdk/tree/main/examples/file-storage/media-transcoder) | File-handling pipeline: upload video → transcode → thumbnail → manifest | `mvn -f examples/file-storage/media-transcoder/pom.xml exec:java` |
 
 ## API Journey Examples
 
@@ -481,10 +533,10 @@ End-to-end examples covering all APIs for each domain:
 
 | Example | APIs | Run |
 |---------|------|-----|
-| [Metadata Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/MetadataManagement.java) | Task & workflow definitions | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.MetadataManagement` |
-| [Workflow Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/WorkflowManagement.java) | Start, monitor, control workflows | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.WorkflowManagement` |
-| [Authorization Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/AuthorizationManagement.java) | Users, groups, permissions | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.AuthorizationManagement` |
-| [Scheduler Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/src/main/java/io/orkes/conductor/sdk/examples/SchedulerManagement.java) | Workflow scheduling | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.SchedulerManagement` |
+| [Metadata Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/MetadataManagement.java) | Task & workflow definitions | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.MetadataManagement` |
+| [Workflow Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/WorkflowManagement.java) | Start, monitor, control workflows | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.WorkflowManagement` |
+| [Authorization Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/AuthorizationManagement.java) | Users, groups, permissions | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.AuthorizationManagement` |
+| [Scheduler Management](https://github.com/conductor-oss/java-sdk/blob/main/examples/old/src/main/java/io/orkes/conductor/sdk/examples/SchedulerManagement.java) | Workflow scheduling | `./gradlew :examples:run -PmainClass=io.orkes.conductor.sdk.examples.SchedulerManagement` |
 
 ## Documentation
 
@@ -563,4 +615,4 @@ Browse all examples on GitHub: [conductor-oss/java-sdk/examples](https://github.
 | Example | Type |
 |---|---|
 | [Readme](https://github.com/conductor-oss/java-sdk/blob/main/examples/README.md) | file |
-| [Src](https://github.com/conductor-oss/java-sdk/tree/main/examples/src) | directory |
+| [Examples](https://github.com/conductor-oss/java-sdk/tree/main/examples) | directory |

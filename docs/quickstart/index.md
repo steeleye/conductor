@@ -86,17 +86,12 @@ conductor workflow create workflow.json
 conductor workflow start -w hello_workflow --sync
 ```
 
-The `--sync` flag waits for completion and prints the full workflow execution JSON to stdout. The CLI also prints a server detection line first, so actual output looks like:
-
-```
-Auto-detected server: http://localhost:8080
-{"workflowId":"3e2a1c9d-...","status":"COMPLETED","tasks":[{...},{...}],"outputParameters":{"summary":"Host orkes-api-sampler-... responded in 0 ms with random value 1141","apiResponse":{...}},...}
-```
+The `--sync` flag waits for completion and prints the full workflow execution JSON to stdout (server detection messages go to stderr).
 
 To extract just the output in a readable form, pipe through `jq`:
 
 ```bash
-conductor workflow start -w hello_workflow --sync 2>/dev/null | tail -1 | jq '.outputParameters'
+conductor workflow start -w hello_workflow --sync 2>/dev/null | jq '.output'
 ```
 
 ```json
@@ -113,8 +108,6 @@ conductor workflow start -w hello_workflow --sync 2>/dev/null | tail -1 | jq '.o
   }
 }
 ```
-
-> **Note:** The `Auto-detected server:` line is written to stdout (not stderr). Use `tail -1` to skip it before piping to `jq`, and `2>/dev/null` to suppress any stderr.
 
 Open [http://localhost:8080](http://localhost:8080) to see the execution visually — the task timeline, inputs/outputs, and status of each step.
 
@@ -198,7 +191,7 @@ curl -X POST http://localhost:8080/api/metadata/taskdefs \
 Save `worker.py`:
 
 ```python
-import time
+import threading
 
 from conductor.client.automator.task_handler import TaskHandler
 from conductor.client.configuration.configuration import Configuration
@@ -227,8 +220,7 @@ def main():
     handler.start_processes()
 
     try:
-        while True:
-            time.sleep(0.1)  # avoid busy-waiting; yield CPU between poll cycles
+        threading.Event().wait()  # block until KeyboardInterrupt; no busy-wait
     except KeyboardInterrupt:
         handler.stop_processes()
 
@@ -287,9 +279,8 @@ Every Conductor workflow execution is fully replayable — restart from the begi
 Take any workflow execution ID from Phase 1 or Phase 2 and restart it:
 
 ```bash
-# The CLI writes "Auto-detected server: ..." to stdout before the JSON.
-# Use tail -1 to skip that line; 2>/dev/null silences stderr.
-WORKFLOW_ID=$(conductor workflow start -w hello_workflow --version 2 --sync 2>/dev/null | tail -1 | jq -r '.workflowId // empty')
+# Start a workflow and capture its ID (printed as a plain UUID)
+WORKFLOW_ID=$(conductor workflow start -w hello_workflow --version 2)
 
 # Restart the entire workflow from the beginning
 curl -X POST "http://localhost:8080/api/workflow/$WORKFLOW_ID/restart"
