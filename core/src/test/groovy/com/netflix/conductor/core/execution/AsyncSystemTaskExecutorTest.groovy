@@ -26,6 +26,7 @@ import com.netflix.conductor.dao.MetadataDAO
 import com.netflix.conductor.dao.QueueDAO
 import com.netflix.conductor.model.TaskModel
 import com.netflix.conductor.model.WorkflowModel
+import com.netflix.conductor.service.ExecutionLockService
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import spock.lang.Specification
@@ -40,6 +41,7 @@ class AsyncSystemTaskExecutorTest extends Specification {
     MetadataDAO metadataDAO
     WorkflowExecutor workflowExecutor
     ParametersUtils parametersUtils
+    ExecutionLockService executionLockService
 
     @Subject
     AsyncSystemTaskExecutor executor
@@ -53,6 +55,7 @@ class AsyncSystemTaskExecutorTest extends Specification {
         metadataDAO = Mock(MetadataDAO.class)
         workflowExecutor = Mock(WorkflowExecutor.class)
         parametersUtils = Mock(ParametersUtils.class)
+        executionLockService = Mock(ExecutionLockService.class)
 
         workflowSystemTask = Mock(WorkflowSystemTask.class) {
             isTaskRetrievalRequired() >> true
@@ -63,7 +66,7 @@ class AsyncSystemTaskExecutorTest extends Specification {
 
         parametersUtils.substituteSecrets(_) >> { args -> args[0] }
 
-        executor = new AsyncSystemTaskExecutor(executionDAOFacade, queueDAO, metadataDAO, properties, workflowExecutor, parametersUtils)
+        executor = new AsyncSystemTaskExecutor(executionDAOFacade, queueDAO, metadataDAO, properties, workflowExecutor, parametersUtils, executionLockService)
     }
 
     // this is not strictly a unit test, but its essential to test AsyncSystemTaskExecutor with SubWorkflow
@@ -94,7 +97,7 @@ class AsyncSystemTaskExecutorTest extends Specification {
         executor.execute(subWorkflowTask, parentTaskId)
 
         then:
-        1 * executionDAOFacade.getTaskModel(parentTaskId) >> task1
+        3 * executionDAOFacade.getTaskModel(parentTaskId) >> task1
         1 * executionDAOFacade.getWorkflowModel(workflowId, subWorkflowTask.isTaskRetrievalRequired()) >> workflow
         1 * workflowExecutor.startWorkflowIdempotent(*_) >> subWorkflow
 
@@ -412,7 +415,7 @@ class AsyncSystemTaskExecutorTest extends Specification {
     def "Execute preserves a callback interval set by the system task"() {
         given:
         properties.systemTaskWorkerCallbackDuration = Duration.ofSeconds(30)
-        executor = new AsyncSystemTaskExecutor(executionDAOFacade, queueDAO, metadataDAO, properties, workflowExecutor, parametersUtils)
+        executor = new AsyncSystemTaskExecutor(executionDAOFacade, queueDAO, metadataDAO, properties, workflowExecutor, parametersUtils, executionLockService)
 
         String workflowId = "workflowId"
         String taskId = "taskId"

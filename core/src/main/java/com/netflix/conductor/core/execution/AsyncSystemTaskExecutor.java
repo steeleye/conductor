@@ -29,6 +29,7 @@ import com.netflix.conductor.dao.QueueDAO;
 import com.netflix.conductor.metrics.Monitors;
 import com.netflix.conductor.model.TaskModel;
 import com.netflix.conductor.model.WorkflowModel;
+import com.netflix.conductor.service.ExecutionLockService;
 
 @Component
 public class AsyncSystemTaskExecutor {
@@ -40,6 +41,7 @@ public class AsyncSystemTaskExecutor {
     private final long systemTaskCallbackTime;
     private final WorkflowExecutor workflowExecutor;
     private final ParametersUtils parametersUtils;
+    private final ExecutionLockService executionLockService;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AsyncSystemTaskExecutor.class);
 
@@ -49,7 +51,8 @@ public class AsyncSystemTaskExecutor {
             MetadataDAO metadataDAO,
             ConductorProperties conductorProperties,
             WorkflowExecutor workflowExecutor,
-            ParametersUtils parametersUtils) {
+            ParametersUtils parametersUtils,
+            ExecutionLockService executionLockService) {
         this.executionDAOFacade = executionDAOFacade;
         this.queueDAO = queueDAO;
         this.metadataDAO = metadataDAO;
@@ -59,6 +62,7 @@ public class AsyncSystemTaskExecutor {
         this.queueTaskMessagePostponeSecs =
                 conductorProperties.getTaskExecutionPostponeDuration().getSeconds();
         this.parametersUtils = parametersUtils;
+        this.executionLockService = executionLockService;
     }
 
     /**
@@ -118,6 +122,8 @@ public class AsyncSystemTaskExecutor {
 
         boolean hasTaskExecutionCompleted = false;
         boolean shouldRemoveTaskFromQueue = false;
+        boolean skipFinalPersistence = false;
+        TaskModel taskPersistedBeforeExit = null;
         String workflowId = task.getWorkflowInstanceId();
         // if we are here the Task object is updated and needs to be persisted regardless of an
         // exception
@@ -155,12 +161,15 @@ public class AsyncSystemTaskExecutor {
 
             boolean scheduled = task.getStatus() == TaskModel.Status.SCHEDULED;
             if (scheduled || task.getStatus() == TaskModel.Status.IN_PROGRESS) {
-                if (scheduled && hasExceededResponseTimeout(task)) {
+                boolean startTimedOut = scheduled && hasExceededResponseTimeout(task);
+                boolean recoveringStart =
+                        scheduled && systemTask.supportsStartRecovery() && task.getStartTime() > 0;
+                if (startTimedOut && !systemTask.supportsStartRecovery()) {
                     // A blocking start() never leaves SCHEDULED, so a redelivered SCHEDULED task
                     // past responseTimeout means its run overran: time it out, don't re-run it
-                    // (#1321). IN_PROGRESS response-timeouts are
-                    // DeciderService.isResponseTimedOut's
-                    // job (it budgets responseTimeout + callbackAfterSeconds).
+                    // unless the task explicitly guarantees that start() is idempotent (#1321).
+                    // IN_PROGRESS response-timeouts are DeciderService.isResponseTimedOut's job (it
+                    // budgets responseTimeout + callbackAfterSeconds).
                     task.setStatus(TaskModel.Status.TIMED_OUT);
                     task.setReasonForIncompletion(
                             "Task did not complete within its responseTimeout of "
@@ -180,7 +189,18 @@ public class AsyncSystemTaskExecutor {
                                 "Could not reserve in-flight message for {}/{}; skipping execution, will retry on redelivery",
                                 task.getTaskType(),
                                 task.getTaskId());
+                        if (recoveringStart) {
+                            // Preserve the existing start marker so the next delivery remains
+                            // same-attempt recovery rather than looking like a fresh start.
+                            skipFinalPersistence = true;
+                        }
                         return;
+                    }
+                    if (recoveringStart) {
+                        LOGGER.info(
+                                "Recovering interrupted start for {}/{}",
+                                task.getTaskType(),
+                                task.getTaskId());
                     }
                     Map<String, Object> literalInput = task.getInputData();
                     // Secrets substitution only sees task.getInputData(); when input has been
@@ -194,13 +214,43 @@ public class AsyncSystemTaskExecutor {
                     task.setInputData(parametersUtils.substituteSecrets(literalInput));
                     try {
                         if (scheduled) {
-                            task.setStartTime(System.currentTimeMillis());
-                            // Persist startTime before invoking so a redelivery can detect an
-                            // overrun (status left unchanged for start()'s SCHEDULED branch).
-                            executionDAOFacade.updateTask(task);
+                            if (!recoveringStart) {
+                                task.setStartTime(System.currentTimeMillis());
+                                // Persist startTime before invoking so a redelivery can detect an
+                                // overrun (status left unchanged for start()'s SCHEDULED branch).
+                                TaskModel persistedStart = persistTask(systemTask, task);
+                                if (persistedStart == null) {
+                                    skipFinalPersistence = true;
+                                    return;
+                                }
+                                if (persistedStart.getStatus().isTerminal()) {
+                                    skipFinalPersistence = true;
+                                    taskPersistedBeforeExit = persistedStart;
+                                    shouldRemoveTaskFromQueue = true;
+                                    hasTaskExecutionCompleted = true;
+                                    return;
+                                }
+                            }
                             Monitors.recordQueueWaitTime(
                                     task.getTaskType(), task.getQueueWaitTime());
-                            systemTask.start(workflow, task, workflowExecutor);
+                            if (recoveringStart) {
+                                skipFinalPersistence = true;
+                                try {
+                                    systemTask.recoverFromStartTimeout(
+                                            workflow, task, workflowExecutor);
+                                } finally {
+                                    // A failed recovery leaves SCHEDULED unchanged in storage so
+                                    // its next delivery cannot be mistaken for a fresh start.
+                                    if (task.getStatus() != TaskModel.Status.SCHEDULED) {
+                                        skipFinalPersistence = false;
+                                    }
+                                }
+                                if (skipFinalPersistence) {
+                                    return;
+                                }
+                            } else {
+                                systemTask.start(workflow, task, workflowExecutor);
+                            }
                         } else {
                             systemTask.execute(workflow, task, workflowExecutor);
                         }
@@ -242,14 +292,70 @@ public class AsyncSystemTaskExecutor {
             Monitors.error(AsyncSystemTaskExecutor.class.getSimpleName(), "executeSystemTask");
             LOGGER.error("Error executing system task - {}, with id: {}", systemTask, taskId, e);
         } finally {
-            executionDAOFacade.updateTask(task);
-            if (shouldRemoveTaskFromQueue) {
-                queueDAO.remove(queueName, task.getTaskId());
-                LOGGER.debug("{} removed from queue: {}", task, queueName);
+            TaskModel persistedTask =
+                    skipFinalPersistence ? taskPersistedBeforeExit : persistTask(systemTask, task);
+            if (persistedTask == null) {
+                postponeQuietly(queueName, task);
+            } else {
+                if (persistedTask.getStatus().isTerminal()) {
+                    shouldRemoveTaskFromQueue = true;
+                    hasTaskExecutionCompleted = true;
+                }
+                if (shouldRemoveTaskFromQueue) {
+                    queueDAO.remove(queueName, persistedTask.getTaskId());
+                    LOGGER.debug("{} removed from queue: {}", persistedTask, queueName);
+                }
+                // if the current task execution has completed, then the workflow needs to be
+                // evaluated
+                if (hasTaskExecutionCompleted) {
+                    workflowExecutor.decide(workflowId);
+                }
             }
-            // if the current task execution has completed, then the workflow needs to be evaluated
-            if (hasTaskExecutionCompleted) {
-                workflowExecutor.decide(workflowId);
+        }
+    }
+
+    /**
+     * Prevents an overlapping original start from overwriting a terminal result persisted by start
+     * recovery. The short critical section is separate from the potentially long-running start.
+     */
+    private TaskModel persistTask(WorkflowSystemTask systemTask, TaskModel task) {
+        if (!systemTask.supportsStartRecovery()) {
+            executionDAOFacade.updateTask(task);
+            return task;
+        }
+
+        String lockId = TaskExecutionLock.lockId(task.getTaskId());
+        executionLockService.waitForLock(lockId);
+        boolean deleteLock = false;
+
+        try {
+            TaskModel current = loadTaskQuietly(task.getTaskId());
+            if (current == null) {
+                LOGGER.warn(
+                        "Could not reload {}/{} while holding its update lock",
+                        task.getTaskType(),
+                        task.getTaskId());
+                return null;
+            }
+            if (current.getStatus().isTerminal()) {
+                deleteLock = true;
+                if (!task.getStatus().isTerminal()) {
+                    LOGGER.info(
+                            "Skipping stale {} update for {}/{} because persisted state is {}",
+                            task.getStatus(),
+                            task.getTaskType(),
+                            task.getTaskId(),
+                            current.getStatus());
+                }
+                return current;
+            }
+            executionDAOFacade.updateTask(task);
+            deleteLock = task.getStatus().isTerminal();
+            return task;
+        } finally {
+            executionLockService.releaseLock(lockId);
+            if (deleteLock) {
+                executionLockService.deleteLock(lockId);
             }
         }
     }

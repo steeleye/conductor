@@ -41,6 +41,7 @@ public class SubWorkflow extends WorkflowSystemTask {
     private static final Logger LOGGER = LoggerFactory.getLogger(SubWorkflow.class);
     private static final String SUB_WORKFLOW_ID = "subWorkflowId";
     private static final String SUB_WORKFLOW_LAUNCH_ERROR = "subWorkflowLaunchError";
+    public static final String SUB_WORKFLOW_LAUNCH_ID = "subWorkflowLaunchId";
 
     private final ObjectMapper objectMapper;
     private final IDGenerator idGenerator;
@@ -169,11 +170,14 @@ public class SubWorkflow extends WorkflowSystemTask {
             // startWorkflowIdempotent serializes concurrent attempts onto the
             // same workflow.
             String parentWorkflowId = task.getWorkflowInstanceId();
+            String plannedLaunchId = getPlannedLaunchId(task);
             String subWorkflowId =
-                    idGenerator.generateSubWorkflowId(
-                            parentWorkflowId, task.getTaskId(), task.getRetryCount());
+                    StringUtils.isNotBlank(plannedLaunchId)
+                            ? plannedLaunchId
+                            : idGenerator.generateSubWorkflowId(
+                                    parentWorkflowId, task.getTaskId(), task.getRetryCount());
             LOGGER.debug(
-                    "Launching sub-workflow task {} in parent workflow {} with deterministic child workflow id {}",
+                    "Launching sub-workflow task {} in parent workflow {} with child workflow id {}",
                     task.getTaskId(),
                     parentWorkflowId,
                     subWorkflowId);
@@ -196,12 +200,6 @@ public class SubWorkflow extends WorkflowSystemTask {
             // initial decide continues asynchronously through the decider queue.
             WorkflowModel subWorkflow =
                     workflowExecutor.startWorkflowIdempotent(startWorkflowInput);
-            if (subWorkflow.getStatus().isTerminal() && !subWorkflow.getStatus().isSuccessful()) {
-                // The deterministic ID collides with a previously-terminated child (e.g. after a
-                // rerun). Start a fresh child with a new random ID instead of reusing the dead one.
-                startWorkflowInput.setWorkflowId(idGenerator.generate());
-                subWorkflow = workflowExecutor.startWorkflowIdempotent(startWorkflowInput);
-            }
             attachToSubWorkflow(task, subWorkflow);
         } catch (TransientException te) {
             task.setStatus(TaskModel.Status.SCHEDULED);
@@ -233,8 +231,8 @@ public class SubWorkflow extends WorkflowSystemTask {
         if (StringUtils.isEmpty(workflowId)) {
             // SCHEDULED-recovery: the parent task is scheduled but its child
             // workflow id was never attached (e.g. async worker crashed mid-
-            // launch). Re-run start() — safe in any caller context because
-            // start() derives the deterministic id from task.workflowInstanceId,
+            // launch). Reconcile the same attempt using its persisted launch id
+            // or the deterministic id derived from task.workflowInstanceId,
             // and the child-id lock inside startWorkflowIdempotent serializes
             // any concurrent re-entry onto the same workflow.
             if (task.getStatus() == TaskModel.Status.SCHEDULED) {
@@ -270,11 +268,16 @@ public class SubWorkflow extends WorkflowSystemTask {
     public void cancel(WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
         String workflowId = task.getSubWorkflowId();
         if (StringUtils.isEmpty(workflowId)) {
+            String plannedLaunchId = getPlannedLaunchId(task);
             workflowId =
-                    idGenerator.generateSubWorkflowId(
-                            workflow.getWorkflowId(), task.getTaskId(), task.getRetryCount());
+                    StringUtils.isNotBlank(plannedLaunchId)
+                            ? plannedLaunchId
+                            : idGenerator.generateSubWorkflowId(
+                                    workflow.getWorkflowId(),
+                                    task.getTaskId(),
+                                    task.getRetryCount());
             LOGGER.info(
-                    "Checking deterministic child workflow {} for unattached sub-workflow task {} in parent workflow {} during cancel",
+                    "Checking planned child workflow {} for unattached sub-workflow task {} in parent workflow {} during cancel",
                     workflowId,
                     task.getTaskId(),
                     workflow.getWorkflowId());
@@ -282,7 +285,7 @@ public class SubWorkflow extends WorkflowSystemTask {
                 terminateSubWorkflow(workflow, workflowExecutor, workflowId);
             } catch (NotFoundException e) {
                 LOGGER.info(
-                        "No deterministic child workflow {} exists for unattached sub-workflow task {} in parent workflow {} during cancel",
+                        "No planned child workflow {} exists for unattached sub-workflow task {} in parent workflow {} during cancel",
                         workflowId,
                         task.getTaskId(),
                         workflow.getWorkflowId());
@@ -327,6 +330,17 @@ public class SubWorkflow extends WorkflowSystemTask {
     @Override
     public boolean isAsync() {
         return true;
+    }
+
+    @Override
+    public boolean supportsStartRecovery() {
+        return true;
+    }
+
+    @Override
+    public void recoverFromStartTimeout(
+            WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
+        start(workflow, task, workflowExecutor);
     }
 
     private void updateTaskStatus(WorkflowModel subworkflow, TaskModel task) {
@@ -390,7 +404,13 @@ public class SubWorkflow extends WorkflowSystemTask {
         task.setReasonForIncompletion(null);
         task.setSubWorkflowId(subWorkflow.getWorkflowId());
         task.addOutput(SUB_WORKFLOW_ID, subWorkflow.getWorkflowId());
+        task.getOutputData().remove(SUB_WORKFLOW_LAUNCH_ID);
         task.getOutputData().remove(SUB_WORKFLOW_LAUNCH_ERROR);
         updateTaskStatus(subWorkflow, task);
+    }
+
+    private String getPlannedLaunchId(TaskModel task) {
+        Object plannedLaunchId = task.getOutputData().get(SUB_WORKFLOW_LAUNCH_ID);
+        return plannedLaunchId instanceof String ? (String) plannedLaunchId : "";
     }
 }

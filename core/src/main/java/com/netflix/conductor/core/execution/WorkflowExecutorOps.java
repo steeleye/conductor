@@ -40,6 +40,7 @@ import com.netflix.conductor.core.WorkflowContext;
 import com.netflix.conductor.core.config.ConductorProperties;
 import com.netflix.conductor.core.dal.ExecutionDAOFacade;
 import com.netflix.conductor.core.exception.*;
+import com.netflix.conductor.core.execution.tasks.SubWorkflow;
 import com.netflix.conductor.core.execution.tasks.SystemTaskRegistry;
 import com.netflix.conductor.core.execution.tasks.Terminate;
 import com.netflix.conductor.core.execution.tasks.WorkflowSystemTask;
@@ -2317,27 +2318,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
                     && rerunFromTask
                             .getTaskType()
                             .equalsIgnoreCase(TaskType.TASK_TYPE_SUB_WORKFLOW)) {
-                rerunFromTask.setScheduledTime(System.currentTimeMillis());
-                rerunFromTask.setStartTime(0);
-                rerunFromTask.setUpdateTime(0);
-                rerunFromTask.setEndTime(0);
-                rerunFromTask.clearOutput();
-                rerunFromTask.setRetried(false);
-                rerunFromTask.setExecuted(false);
-                rerunFromTask.setPollCount(0);
-                rerunFromTask.setSubWorkflowId(null);
-                rerunFromTask.setStatus(SCHEDULED);
-                rerunFromTask.setReasonForIncompletion(null);
-                // Start the child workflow synchronously so the task is IN_PROGRESS before we
-                // return — tests that read state immediately after rerun() need this.
-                systemTaskRegistry
-                        .get(TaskType.TASK_TYPE_SUB_WORKFLOW)
-                        .start(workflow, rerunFromTask, this);
-                if (rerunFromTask.getStatus() == SCHEDULED) {
-                    // start() hit a transient error — fall back to async queue processing.
-                    addTaskToQueue(rerunFromTask);
-                }
-                executionDAOFacade.updateTask(rerunFromTask);
+                restartSubWorkflowTaskForRerun(workflow, rerunFromTask);
                 finalizeRerun(workflow, rerunFromTask);
                 return true;
             }
@@ -2407,6 +2388,41 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
         return false;
     }
 
+    private void restartSubWorkflowTaskForRerun(WorkflowModel workflow, TaskModel rerunFromTask) {
+        String lockId = TaskExecutionLock.lockId(rerunFromTask.getTaskId());
+        executionLockService.waitForLock(lockId);
+        boolean deleteLock = false;
+        try {
+            rerunFromTask.setScheduledTime(System.currentTimeMillis());
+            rerunFromTask.setStartTime(0);
+            rerunFromTask.setUpdateTime(0);
+            rerunFromTask.setEndTime(0);
+            rerunFromTask.clearOutput();
+            rerunFromTask.addOutput(SubWorkflow.SUB_WORKFLOW_LAUNCH_ID, idGenerator.generate());
+            rerunFromTask.setRetried(false);
+            rerunFromTask.setExecuted(false);
+            rerunFromTask.setPollCount(0);
+            rerunFromTask.setSubWorkflowId(null);
+            rerunFromTask.setStatus(SCHEDULED);
+            rerunFromTask.setReasonForIncompletion(null);
+            // Persist and queue the planned child id before launch so another worker can recover
+            // the exact same rerun if this process stops during start().
+            executionDAOFacade.updateTask(rerunFromTask);
+            addTaskToQueue(rerunFromTask);
+            // Start synchronously so callers observe IN_PROGRESS immediately.
+            systemTaskRegistry
+                    .get(TaskType.TASK_TYPE_SUB_WORKFLOW)
+                    .start(workflow, rerunFromTask, this);
+            executionDAOFacade.updateTask(rerunFromTask);
+            deleteLock = rerunFromTask.getStatus().isTerminal();
+        } finally {
+            executionLockService.releaseLock(lockId);
+            if (deleteLock) {
+                executionLockService.deleteLock(lockId);
+            }
+        }
+    }
+
     private void finalizeRerun(WorkflowModel workflow, TaskModel rerunFromTask) {
         // FORK_JOIN_DYNAMIC rerun: rerunFromTask is the TASK_TYPE_FORK model created by the
         // mapper (task type "FORK", not "FORK_JOIN_DYNAMIC"). Seq-based removal already stripped
@@ -2451,6 +2467,9 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
                                         task.getTaskType())) {
                                     task.setSubWorkflowId(null);
                                     task.getOutputData().remove("subWorkflowId");
+                                    task.addOutput(
+                                            SubWorkflow.SUB_WORKFLOW_LAUNCH_ID,
+                                            idGenerator.generate());
                                 }
                                 if (TaskType.JOIN.toString().equalsIgnoreCase(task.getTaskType())
                                         || TaskType.DO_WHILE
@@ -2466,14 +2485,21 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
                                     tasksToQueue.add(task);
                                 }
                                 task.setExecuted(false);
-                                task.setStartTime(System.currentTimeMillis());
+                                task.setStartTime(
+                                        TaskType.TASK_TYPE_SUB_WORKFLOW.equalsIgnoreCase(
+                                                        task.getTaskType())
+                                                ? 0
+                                                : System.currentTimeMillis());
                                 task.setEndTime(0);
                                 task.setReasonForIncompletion(null);
                             }
                         });
         // Write SCHEDULED to DB before queueing so async workers (e.g. SystemTaskWorker)
         // never read a stale CANCELED/FAILED state and silently drop the queue entry.
-        executionDAOFacade.updateTasks(workflow.getTasks());
+        executionDAOFacade.updateTasks(
+                workflow.getTasks().stream()
+                        .filter(task -> !task.getTaskId().equals(rerunFromTask.getTaskId()))
+                        .collect(Collectors.toList()));
         tasksToQueue.forEach(this::addTaskToQueue);
         // Push AFTER all sibling tasks are reset so async decider never sees stale CANCELED/FAILED
         queueDAO.push(
@@ -2528,38 +2554,51 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
 
     @VisibleForTesting
     void updateParentWorkflowTask(WorkflowModel subWorkflow) {
-        TaskModel subWorkflowTask =
-                executionDAOFacade.getTaskModel(subWorkflow.getParentWorkflowTaskId());
-        if (subWorkflowTask == null) {
-            // orphan sub-workflow: parent task was cleared (e.g. parent workflow restarted)
-            return;
-        }
-        // Generation fence: a rerun replaces the parent's fork generation wholesale — the old
-        // SUB_WORKFLOW task rows survive in the task store but are no longer part of the
-        // parent's task list. A late terminal event from the superseded generation's child
-        // must not propagate through that stale task record, or it fails the parent's fresh
-        // generation (observed in CI: parent FAILED citing a task absent from its own task
-        // list). Retry has an analogous fence via isRetried(); rerun needs list membership.
-        WorkflowModel parentWorkflow =
-                executionDAOFacade.getWorkflowModel(subWorkflowTask.getWorkflowInstanceId(), true);
-        if (parentWorkflow != null
-                && parentWorkflow.getTasks().stream()
-                        .noneMatch(t -> t.getTaskId().equals(subWorkflowTask.getTaskId()))) {
-            LOGGER.info(
-                    "Sub-workflow {} finished but its parent task {} is no longer part of parent {}"
-                            + " (superseded by rerun/restart) — dropping stale propagation",
-                    subWorkflow.getWorkflowId(),
-                    subWorkflowTask.getTaskId(),
-                    subWorkflowTask.getWorkflowInstanceId());
-            return;
-        }
-        executeSubworkflowTaskAndSyncData(subWorkflow, subWorkflowTask);
-        executionDAOFacade.updateTask(subWorkflowTask);
-        if (subWorkflowTask.getStatus().isTerminal()) {
-            // This fork branch's sub-workflow just finished; a sibling JOIN waiting on it may now
-            // be satisfiable. Nudge it off its exponential-backoff poll so the parent completes
-            // promptly instead of stalling until the JOIN's next scheduled evaluation.
-            expediteInProgressJoinTasks(subWorkflowTask.getWorkflowInstanceId());
+        String taskId = subWorkflow.getParentWorkflowTaskId();
+        String lockId = TaskExecutionLock.lockId(taskId);
+        executionLockService.waitForLock(lockId);
+        boolean deleteLock = false;
+        try {
+            TaskModel subWorkflowTask = executionDAOFacade.getTaskModel(taskId);
+            if (subWorkflowTask == null) {
+                // orphan sub-workflow: parent task was cleared (e.g. parent workflow restarted)
+                return;
+            }
+            // Generation fence: a rerun replaces the parent's fork generation wholesale — the old
+            // SUB_WORKFLOW task rows survive in the task store but are no longer part of the
+            // parent's task list. A late terminal event from the superseded generation's child
+            // must not propagate through that stale task record, or it fails the parent's fresh
+            // generation (observed in CI: parent FAILED citing a task absent from its own task
+            // list). Retry has an analogous fence via isRetried(); rerun needs list membership.
+            WorkflowModel parentWorkflow =
+                    executionDAOFacade.getWorkflowModel(
+                            subWorkflowTask.getWorkflowInstanceId(), true);
+            if (parentWorkflow != null
+                    && parentWorkflow.getTasks().stream()
+                            .noneMatch(t -> t.getTaskId().equals(subWorkflowTask.getTaskId()))) {
+                LOGGER.info(
+                        "Sub-workflow {} finished but its parent task {} is no longer part of parent {}"
+                                + " (superseded by rerun/restart) — dropping stale propagation",
+                        subWorkflow.getWorkflowId(),
+                        subWorkflowTask.getTaskId(),
+                        subWorkflowTask.getWorkflowInstanceId());
+                return;
+            }
+            executeSubworkflowTaskAndSyncData(subWorkflow, subWorkflowTask);
+            executionDAOFacade.updateTask(subWorkflowTask);
+            if (subWorkflowTask.getStatus().isTerminal()) {
+                deleteLock = true;
+                // This fork branch's sub-workflow just finished; a sibling JOIN waiting on it may
+                // now be satisfiable. Nudge it off its exponential-backoff poll so the parent
+                // completes promptly instead of stalling until the JOIN's next scheduled
+                // evaluation.
+                expediteInProgressJoinTasks(subWorkflowTask.getWorkflowInstanceId());
+            }
+        } finally {
+            executionLockService.releaseLock(lockId);
+            if (deleteLock) {
+                executionLockService.deleteLock(lockId);
+            }
         }
     }
 

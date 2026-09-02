@@ -30,7 +30,7 @@ public abstract class WorkflowSystemTask {
     /**
      * Start the task execution.
      *
-     * <p>Called only once, and first, when the task status is SCHEDULED.
+     * <p>Called once, and first, when the task status is SCHEDULED.
      *
      * @param workflow Workflow for which the task is being started
      * @param task Instance of the Task
@@ -38,6 +38,23 @@ public abstract class WorkflowSystemTask {
      */
     public void start(WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
         // Do nothing unless overridden by the task implementation
+    }
+
+    /** Whether this task can reconcile an interrupted start for the same task attempt. */
+    public boolean supportsStartRecovery() {
+        return false;
+    }
+
+    /**
+     * Reconciles a start that did not respond before its timeout.
+     *
+     * <p>Implementations must converge on the same external effect as the original task attempt and
+     * must not create a generic retry attempt.
+     */
+    public void recoverFromStartTimeout(
+            WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
+        throw new UnsupportedOperationException(
+                taskType + " does not support recovery from a start timeout");
     }
 
     /**

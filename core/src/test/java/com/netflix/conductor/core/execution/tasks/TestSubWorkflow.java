@@ -402,6 +402,85 @@ public class TestSubWorkflow {
     }
 
     @Test
+    public void testStartTimeoutRecoveryAttachesFailedDeterministicChildWithoutReplacement() {
+        WorkflowModel workflowInstance = newParentWorkflow();
+        TaskModel task = newTask();
+        task.setInputData(inputData("UnitWorkFlow", 1));
+
+        WorkflowModel failedSubWorkflow = new WorkflowModel();
+        failedSubWorkflow.setWorkflowId(CHILD_SUB_WORKFLOW_ID);
+        failedSubWorkflow.setStatus(WorkflowModel.Status.FAILED);
+        failedSubWorkflow.setReasonForIncompletion("child failed");
+
+        StartWorkflowInput startWorkflowInput =
+                expectedStartWorkflowInput(
+                        workflowInstance, task, "UnitWorkFlow", 1, task.getInputData(), null, null);
+        mockSubWorkflowLaunch(task, startWorkflowInput, failedSubWorkflow);
+
+        subWorkflow.recoverFromStartTimeout(workflowInstance, task, workflowExecutor);
+
+        assertEquals(CHILD_SUB_WORKFLOW_ID, task.getSubWorkflowId());
+        assertEquals(TaskModel.Status.FAILED, task.getStatus());
+        verify(idGenerator, never()).generate();
+    }
+
+    @Test
+    public void testNormalStartUsesPlannedChildForExplicitRerun() {
+        WorkflowModel workflowInstance = newParentWorkflow();
+        TaskModel task = newTask();
+        task.setInputData(inputData("UnitWorkFlow", 1));
+        task.addOutput(SubWorkflow.SUB_WORKFLOW_LAUNCH_ID, "replacement-child");
+
+        WorkflowModel replacementSubWorkflow = new WorkflowModel();
+        replacementSubWorkflow.setWorkflowId("replacement-child");
+        replacementSubWorkflow.setStatus(WorkflowModel.Status.RUNNING);
+
+        when(workflowExecutor.startWorkflowIdempotent(any())).thenReturn(replacementSubWorkflow);
+
+        subWorkflow.start(workflowInstance, task, workflowExecutor);
+
+        assertEquals("replacement-child", task.getSubWorkflowId());
+        assertEquals(TaskModel.Status.IN_PROGRESS, task.getStatus());
+        assertFalse(task.getOutputData().containsKey(SubWorkflow.SUB_WORKFLOW_LAUNCH_ID));
+        verify(workflowExecutor)
+                .startWorkflowIdempotent(
+                        expectedStartWorkflowInput(
+                                workflowInstance,
+                                task,
+                                "UnitWorkFlow",
+                                1,
+                                task.getInputData(),
+                                null,
+                                null,
+                                "replacement-child"));
+        verify(idGenerator, never())
+                .generateSubWorkflowId(PARENT_WORKFLOW_ID, PARENT_TASK_ID, task.getRetryCount());
+    }
+
+    @Test
+    public void testExecuteRecoveryAttachesFailedDeterministicChildWithoutReplacement() {
+        WorkflowModel workflowInstance = newParentWorkflow();
+        TaskModel task = newTask();
+        task.setInputData(inputData("UnitWorkFlow", 1));
+
+        WorkflowModel failedSubWorkflow = new WorkflowModel();
+        failedSubWorkflow.setWorkflowId(CHILD_SUB_WORKFLOW_ID);
+        failedSubWorkflow.setStatus(WorkflowModel.Status.FAILED);
+        failedSubWorkflow.setReasonForIncompletion("child failed");
+
+        StartWorkflowInput startWorkflowInput =
+                expectedStartWorkflowInput(
+                        workflowInstance, task, "UnitWorkFlow", 1, task.getInputData(), null, null);
+        mockSubWorkflowLaunch(task, startWorkflowInput, failedSubWorkflow);
+
+        assertTrue(subWorkflow.execute(workflowInstance, task, workflowExecutor));
+
+        assertEquals(CHILD_SUB_WORKFLOW_ID, task.getSubWorkflowId());
+        assertEquals(TaskModel.Status.FAILED, task.getStatus());
+        verify(idGenerator, never()).generate();
+    }
+
+    @Test
     public void testCancelIsNoOpWhenSubWorkflowNotFoundInStore() {
         WorkflowModel workflowInstance = newParentWorkflow();
         workflowInstance.setStatus(WorkflowModel.Status.TERMINATED);
