@@ -61,8 +61,14 @@ FROM debian:stable-slim
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
+# nginx is pinned to a version patched against CVE-2026-42533 (map directive heap
+# buffer overflow) and CVE-2026-60005 (ngx_http_slice_module uninitialized memory
+# read). Bump this alongside Debian's nginx security tracker as new advisories land:
+# https://security-tracker.debian.org/tracker/source-package/nginx
+ARG NGINX_VERSION=1.26.3-3+deb13u8
+
 RUN apt-get update && apt-get upgrade -y --no-install-recommends \
-    && apt-get install -y --no-install-recommends openjdk-21-jre-headless nginx curl ca-certificates \
+    && apt-get install -y --no-install-recommends openjdk-21-jre-headless nginx=${NGINX_VERSION} curl ca-certificates \
     && rm -f /etc/nginx/sites-enabled/default \
     && rm -rf /var/lib/apt/lists/*
 
