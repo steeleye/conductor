@@ -129,8 +129,11 @@ allprojects {
 
         // Security: minimum version floors for CVE-patched transitive dependencies.
         constraints {
-            implementation('org.apache.tika:tika-core:3.2.2') {
-                because 'CVE-2025-66516: tika-parser-pdf-module vulnerability'
+            implementation("org.apache.tika:tika-core:${revTika}") {
+                because 'CVE-2025-66516 and Bouncy Castle CVEs fixed through Tika 3.3.2'
+            }
+            implementation("org.apache.tika:tika-parsers-standard-package:${revTika}") {
+                because 'Tika 3.3.2 aligns all Bouncy Castle dependencies at 1.85'
             }
             implementation('commons-beanutils:commons-beanutils:1.11.0') {
                 because 'CVE-2025-48734: PropertyUtilsBean enum suppression'

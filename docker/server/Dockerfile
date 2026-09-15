@@ -73,8 +73,9 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # TODO(remove): libacl1/libattr1 (pulled in transitively by coreutils/tar/sed/passwd)
-# are vulnerable to CVE-2026-54369 / CVE-2026-54371 (symlink-traversal in the
-# pathname-based ACL/xattr functions) below 2.4.0/2.6.0. Debian has NOT backported
+# are vulnerable to CVE-2026-54369 / CVE-2026-54370 / CVE-2026-54371
+# (symlink-traversal and TOCTOU flaws in pathname-based ACL/xattr functions)
+# below 2.4.0/2.6.0. Debian has NOT backported
 # fixed versions to trixie yet - the fix only exists in sid today because the
 # acl/attr CLI tools' ABI changes carry a regression risk the maintainers flagged.
 # Those CLI tools aren't installed in this image, and coreutils/tar/sed/passwd/nginx
@@ -85,6 +86,7 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
 # >>> apt-get install line above) once trixie/trixie-security ships a fixed
 # >>> version - check before removing:
 # https://security-tracker.debian.org/tracker/CVE-2026-54369
+# https://security-tracker.debian.org/tracker/CVE-2026-54370
 # https://security-tracker.debian.org/tracker/CVE-2026-54371
 ARG LIBACL1_VERSION=2.4.0-1
 ARG LIBATTR1_VERSION=1:2.6.0-1
