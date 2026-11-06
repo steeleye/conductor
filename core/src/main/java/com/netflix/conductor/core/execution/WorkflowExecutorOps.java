@@ -12,6 +12,7 @@
  */
 package com.netflix.conductor.core.execution;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.function.Predicate;
@@ -26,6 +27,7 @@ import org.springframework.stereotype.Component;
 import com.netflix.conductor.annotations.Trace;
 import com.netflix.conductor.annotations.VisibleForTesting;
 import com.netflix.conductor.common.metadata.tasks.*;
+import com.netflix.conductor.common.metadata.workflow.IdempotencyStrategy;
 import com.netflix.conductor.common.metadata.workflow.RerunWorkflowRequest;
 import com.netflix.conductor.common.metadata.workflow.SkipTaskRequest;
 import com.netflix.conductor.common.metadata.workflow.WorkflowDef;
@@ -1977,6 +1979,16 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
 
     @Override
     public String startWorkflow(StartWorkflowInput input) {
+        if (StringUtils.isNotBlank(input.getIdempotencyKey())) {
+            Preconditions.checkState(
+                    properties.isWorkflowExecutionLockEnabled(),
+                    "Idempotent workflow starts require workflow execution locking to be enabled");
+            WorkflowDef workflowDefinition = resolveWorkflowDefinition(input);
+            input.setWorkflowId(
+                    idempotentWorkflowId(workflowDefinition.getName(), input.getIdempotencyKey()));
+            return startWorkflowIdempotent(input, workflowDefinition, true).getWorkflowId();
+        }
+
         WorkflowDef workflowDefinition = resolveWorkflowDefinition(input);
         String workflowId =
                 Optional.ofNullable(input.getWorkflowId()).orElseGet(idGenerator::generate);
@@ -2008,11 +2020,15 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
 
     @Override
     public WorkflowModel startWorkflowIdempotent(StartWorkflowInput input) {
+        return startWorkflowIdempotent(input, resolveWorkflowDefinition(input), false);
+    }
+
+    private WorkflowModel startWorkflowIdempotent(
+            StartWorkflowInput input, WorkflowDef workflowDefinition, boolean evaluateInline) {
         Preconditions.checkArgument(
                 StringUtils.isNotBlank(input.getWorkflowId()),
                 "workflowId must be present for idempotent workflow start");
 
-        WorkflowDef workflowDefinition = resolveWorkflowDefinition(input);
         String workflowId = input.getWorkflowId();
 
         if (!executionLockService.acquireLock(workflowId)) {
@@ -2025,7 +2041,24 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
                 WorkflowModel existingWorkflow =
                         executionDAOFacade.getWorkflowModelFromExecutionDAO(workflowId, false);
                 existingWorkflowFound = true;
-                if (!existingWorkflow.getStatus().isTerminal()) {
+
+                IdempotencyStrategy strategy =
+                        Optional.ofNullable(input.getIdempotencyStrategy())
+                                .orElse(IdempotencyStrategy.RETURN_EXISTING);
+                if (strategy == IdempotencyStrategy.FAIL) {
+                    throw new ConflictException(
+                            "Workflow with idempotency key already exists: %s",
+                            input.getIdempotencyKey());
+                }
+                if (strategy == IdempotencyStrategy.FAIL_ON_RUNNING
+                        && !existingWorkflow.getStatus().isTerminal()) {
+                    throw new ConflictException(
+                            "Workflow with idempotency key is still running: %s",
+                            input.getIdempotencyKey());
+                }
+                if (!evaluateInline
+                        && !existingWorkflow.getStatus().isTerminal()
+                        && strategy == IdempotencyStrategy.RETURN_EXISTING) {
                     expediteLazyWorkflowEvaluation(existingWorkflow.getWorkflowId());
                 }
                 return existingWorkflow;
@@ -2036,7 +2069,11 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
             }
 
             WorkflowModel workflow = createWorkflowModel(input, workflowDefinition, workflowId);
-            createAndQueueEvaluationWithLock(workflow);
+            if (evaluateInline) {
+                createAndEvaluateWithLock(workflow);
+            } else {
+                createAndQueueEvaluationWithLock(workflow);
+            }
 
             Monitors.recordWorkflowStartSuccess(
                     workflow.getWorkflowName(),
@@ -2060,6 +2097,13 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
         } finally {
             executionLockService.releaseLock(workflowId);
         }
+    }
+
+    private String idempotentWorkflowId(String workflowName, String idempotencyKey) {
+        String clientApp = StringUtils.defaultString(WorkflowContext.get().getClientApp());
+        String scopedKey =
+                String.join("\u0000", "workflow", clientApp, workflowName, idempotencyKey);
+        return UUID.nameUUIDFromBytes(scopedKey.getBytes(StandardCharsets.UTF_8)).toString();
     }
 
     @Override
@@ -2145,6 +2189,7 @@ public class WorkflowExecutorOps implements WorkflowExecutor {
         WorkflowModel workflow = new WorkflowModel();
         workflow.setWorkflowId(workflowId);
         workflow.setCorrelationId(input.getCorrelationId());
+        workflow.setIdempotencyKey(input.getIdempotencyKey());
         workflow.setPriority(input.getPriority() == null ? 0 : input.getPriority());
         workflow.setWorkflowDefinition(workflowDefinition);
         workflow.setStatus(WorkflowModel.Status.RUNNING);

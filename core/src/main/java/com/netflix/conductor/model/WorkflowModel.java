@@ -67,6 +67,8 @@ public class WorkflowModel {
 
     private String correlationId;
 
+    private String idempotencyKey;
+
     private String reRunFromWorkflowId;
 
     private String reasonForIncompletion;
@@ -260,6 +262,14 @@ public class WorkflowModel {
 
     public void setCorrelationId(String correlationId) {
         this.correlationId = correlationId;
+    }
+
+    public String getIdempotencyKey() {
+        return idempotencyKey;
+    }
+
+    public void setIdempotencyKey(String idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
     }
 
     public String getReRunFromWorkflowId() {
@@ -514,6 +524,7 @@ public class WorkflowModel {
                 && Objects.equals(output, that.output)
                 && Objects.equals(outputPayload, that.outputPayload)
                 && Objects.equals(getCorrelationId(), that.getCorrelationId())
+                && Objects.equals(getIdempotencyKey(), that.getIdempotencyKey())
                 && Objects.equals(getReRunFromWorkflowId(), that.getReRunFromWorkflowId())
                 && Objects.equals(getReasonForIncompletion(), that.getReasonForIncompletion())
                 && Objects.equals(getEvent(), that.getEvent())
@@ -548,6 +559,7 @@ public class WorkflowModel {
                 output,
                 outputPayload,
                 getCorrelationId(),
+                getIdempotencyKey(),
                 getReRunFromWorkflowId(),
                 getReasonForIncompletion(),
                 getEvent(),

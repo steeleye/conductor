@@ -35,7 +35,9 @@ import com.netflix.conductor.common.metadata.tasks.PollData;
 import com.netflix.conductor.common.metadata.tasks.TaskDef;
 import com.netflix.conductor.common.metadata.tasks.TaskResult;
 import com.netflix.conductor.common.metadata.tasks.TaskType;
+import com.netflix.conductor.common.metadata.workflow.IdempotencyStrategy;
 import com.netflix.conductor.common.metadata.workflow.RerunWorkflowRequest;
+import com.netflix.conductor.common.metadata.workflow.StartWorkflowRequest;
 import com.netflix.conductor.common.metadata.workflow.WorkflowDef;
 import com.netflix.conductor.common.metadata.workflow.WorkflowTask;
 import com.netflix.conductor.common.utils.ExternalPayloadStorage;
@@ -87,6 +89,7 @@ public class TestWorkflowExecutor {
     private TaskStatusListener taskStatusListener;
     private ExecutionLockService executionLockService;
     private ExternalPayloadStorageUtils externalPayloadStorageUtils;
+    private ConductorProperties properties;
 
     @Configuration
     @ComponentScan(basePackageClasses = {Evaluator.class}) // load all Evaluator beans.
@@ -201,11 +204,12 @@ public class TestWorkflowExecutor {
                         Duration.ofMinutes(60));
         MetadataMapperService metadataMapperService = new MetadataMapperService(metadataDAO);
 
-        ConductorProperties properties = mock(ConductorProperties.class);
+        properties = mock(ConductorProperties.class);
         when(properties.getActiveWorkerLastPollTimeout()).thenReturn(Duration.ofSeconds(100));
         when(properties.getTaskExecutionPostponeDuration()).thenReturn(Duration.ofSeconds(60));
         when(properties.getWorkflowOffsetTimeout()).thenReturn(Duration.ofSeconds(30));
         when(properties.getLockLeaseTime()).thenReturn(Duration.ofSeconds(30));
+        when(properties.isWorkflowExecutionLockEnabled()).thenReturn(true);
 
         workflowExecutor =
                 new WorkflowExecutorOps(
@@ -1020,6 +1024,142 @@ public class TestWorkflowExecutor {
         verify(executionDAOFacade).createWorkflow(any());
         verify(queueDAO).postpone("_deciderQueue", "queued-workflow-id", 10, 0);
         verify(executionLockService, atLeastOnce()).releaseLock("queued-workflow-id");
+    }
+
+    @Test
+    public void testTopLevelStartReturnsSameWorkflowForRepeatedIdempotencyKey() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("top-level-idempotent-workflow");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setIdempotencyKey("scheduled-occurrence-1");
+
+        WorkflowModel[] persistedWorkflow = new WorkflowModel[1];
+        when(executionLockService.acquireLock(anyString())).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO(anyString(), eq(false)))
+                .thenAnswer(
+                        invocation -> {
+                            if (persistedWorkflow[0] == null) {
+                                throw new NotFoundException("not found");
+                            }
+                            return persistedWorkflow[0];
+                        });
+        when(executionDAOFacade.createWorkflow(any()))
+                .thenAnswer(
+                        invocation -> {
+                            persistedWorkflow[0] = invocation.getArgument(0);
+                            return persistedWorkflow[0].getWorkflowId();
+                        });
+
+        String firstWorkflowId = workflowExecutor.startWorkflow(input);
+        String retryWorkflowId = workflowExecutor.startWorkflow(input);
+
+        assertEquals(firstWorkflowId, retryWorkflowId);
+        assertEquals("scheduled-occurrence-1", persistedWorkflow[0].getIdempotencyKey());
+        verify(executionDAOFacade, times(1)).createWorkflow(any());
+        verify(executionLockService, times(2)).acquireLock(firstWorkflowId);
+    }
+
+    @Test
+    public void testTopLevelIdempotentStartDoesNotExpediteExistingWorkflow() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("existing-top-level-workflow");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setIdempotencyKey("existing-occurrence");
+
+        WorkflowModel existingWorkflow = new WorkflowModel();
+        existingWorkflow.setWorkflowId("existing-id");
+        existingWorkflow.setStatus(WorkflowModel.Status.RUNNING);
+        when(executionLockService.acquireLock(anyString())).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO(anyString(), eq(false)))
+                .thenReturn(existingWorkflow);
+
+        assertEquals("existing-id", workflowExecutor.startWorkflow(input));
+
+        verify(executionDAOFacade, never()).createWorkflow(any());
+        verify(queueDAO, never()).push(anyString(), anyString(), anyInt(), anyLong());
+        verify(queueDAO, never()).postpone(anyString(), anyString(), anyInt(), anyLong());
+    }
+
+    @Test(expected = ConflictException.class)
+    public void testIdempotencyFailStrategyRejectsExistingWorkflow() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("duplicate-rejected-workflow");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setWorkflowId("existing-workflow-id");
+        input.setIdempotencyKey("existing-key");
+        input.setIdempotencyStrategy(IdempotencyStrategy.FAIL);
+
+        WorkflowModel existingWorkflow = new WorkflowModel();
+        existingWorkflow.setWorkflowId("existing-workflow-id");
+        existingWorkflow.setStatus(WorkflowModel.Status.RUNNING);
+        when(executionLockService.acquireLock("existing-workflow-id")).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO("existing-workflow-id", false))
+                .thenReturn(existingWorkflow);
+
+        workflowExecutor.startWorkflowIdempotent(input);
+    }
+
+    @Test(expected = ConflictException.class)
+    public void testIdempotencyFailOnRunningRejectsExistingRunningWorkflow() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("running-duplicate-workflow");
+        workflowDef.setVersion(1);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setWorkflowDefinition(workflowDef);
+        input.setName(workflowDef.getName());
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setWorkflowId("running-workflow-id");
+        input.setIdempotencyKey("running-key");
+        input.setIdempotencyStrategy(IdempotencyStrategy.FAIL_ON_RUNNING);
+
+        WorkflowModel existingWorkflow = new WorkflowModel();
+        existingWorkflow.setWorkflowId("running-workflow-id");
+        existingWorkflow.setStatus(WorkflowModel.Status.RUNNING);
+        when(executionLockService.acquireLock("running-workflow-id")).thenReturn(true);
+        when(executionDAOFacade.getWorkflowModelFromExecutionDAO("running-workflow-id", false))
+                .thenReturn(existingWorkflow);
+
+        workflowExecutor.startWorkflowIdempotent(input);
+    }
+
+    @Test
+    public void testStartWorkflowRequestCopiesIdempotencyFields() {
+        StartWorkflowRequest request = new StartWorkflowRequest();
+        request.setIdempotencyKey("request-key");
+        request.setIdempotencyStrategy(IdempotencyStrategy.RETURN_EXISTING);
+
+        StartWorkflowInput input = new StartWorkflowInput(request);
+
+        assertEquals("request-key", input.getIdempotencyKey());
+        assertEquals(IdempotencyStrategy.RETURN_EXISTING, input.getIdempotencyStrategy());
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void testTopLevelIdempotentStartRequiresWorkflowExecutionLock() {
+        when(properties.isWorkflowExecutionLockEnabled()).thenReturn(false);
+
+        StartWorkflowInput input = new StartWorkflowInput();
+        input.setName("locked-workflow");
+        input.setWorkflowInput(Collections.emptyMap());
+        input.setIdempotencyKey("scheduled-occurrence-2");
+
+        workflowExecutor.startWorkflow(input);
     }
 
     @Test(expected = NotFoundException.class)
