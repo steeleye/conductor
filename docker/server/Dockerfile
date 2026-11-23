@@ -20,8 +20,13 @@ ARG INDEXING_BACKEND=elasticsearch
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
-# JDK 21 is required by the Gradle toolchain (release=21); git/bash for the Gradle wrapper and build scripts
-RUN apk add --no-cache openjdk-21 openjdk-21-default-jvm bash git
+# The base image's default apk repo (apk.cgr.dev) requires Chainguard auth; use the public Wolfi repo
+ARG WOLFI_APK_REPO=https://packages.wolfi.dev/os
+RUN echo "${WOLFI_APK_REPO}" > /etc/apk/repositories
+
+# JDK 21 is required by the Gradle toolchain (release=21); git/bash for the Gradle wrapper and build scripts;
+# libstdc++ for the native protoc/protoc-gen-grpc-java executables
+RUN apk add --no-cache openjdk-21 openjdk-21-default-jdk bash git libstdc++
 ENV JAVA_HOME=/usr/lib/jvm/default-jvm
 
 COPY . /conductor
@@ -53,7 +58,9 @@ COPY ui /conductor/ui
 WORKDIR /conductor/ui
 
 # Node is only needed when building the UI from source; corepack provides yarn
+ARG WOLFI_APK_REPO=https://packages.wolfi.dev/os
 RUN if [ "$PREBUILT" = "false" ]; then \
+      echo "${WOLFI_APK_REPO}" > /etc/apk/repositories && \
       apk add --no-cache nodejs-24 npm corepack; \
     fi
 
@@ -73,6 +80,10 @@ RUN if [ "$PREBUILT" = "false" ]; then \
 FROM ${WOLFI_BASE}
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
+
+# The base image's default apk repo (apk.cgr.dev) requires Chainguard auth; use the public Wolfi repo
+ARG WOLFI_APK_REPO=https://packages.wolfi.dev/os
+RUN echo "${WOLFI_APK_REPO}" > /etc/apk/repositories
 
 # Runtime needs: Java 21 JRE, nginx (UI on 5000), curl (healthcheck), CA certificates,
 # and coreutils (tee) + a POSIX shell (startup.sh). Wolfi is rolling, so security fixes
