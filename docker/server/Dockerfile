@@ -54,8 +54,7 @@ WORKDIR /conductor/ui
 
 # Node is only needed when building the UI from source; corepack provides yarn
 RUN if [ "$PREBUILT" = "false" ]; then \
-      apk add --no-cache nodejs-24 npm && \
-      (command -v corepack >/dev/null 2>&1 || npm install -g corepack); \
+      apk add --no-cache nodejs-24 npm corepack; \
     fi
 
 RUN if [ "$PREBUILT" = "false" ]; then \

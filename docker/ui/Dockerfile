@@ -1,12 +1,14 @@
 #
 # conductor:ui - Conductor UI
 #
-FROM node:20-alpine
+ARG WOLFI_BASE=cgr.dev/chainguard/wolfi-base:latest
+
+FROM ${WOLFI_BASE}
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
-# Install the required packages for the node build
-# to run on alpine
-RUN apk update && apk add --no-cache python3 py3-pip make g++
+# Node 20 (same major as before), corepack for yarn, and the toolchain for native modules
+RUN apk add --no-cache nodejs-20 npm corepack python3 py3-pip make build-base \
+    && corepack enable
 
 # A directory within the virtualized Docker environment
 # Becomes more relevant when using Docker Compose later
