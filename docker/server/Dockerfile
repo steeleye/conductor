@@ -38,7 +38,9 @@ RUN if [ "$PREBUILT" = "true" ]; then \
 # ===========================================================================================================
 # 1. UI builder stage
 # ===========================================================================================================
-FROM node:lts AS ui-builder
+# Pinned to Node 24: node:lts moved to 26, and Node 25+ no longer ships corepack,
+# which the yarn setup below needs.
+FROM node:24 AS ui-builder
 
 ARG PREBUILT=false
 ARG YARN_OPTS
