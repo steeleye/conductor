@@ -6,6 +6,10 @@
 #   PREBUILT=true:  Skips builds, uses pre-built artifacts (CI multi-arch)
 #
 
+# Runtime base for the final stage (PP-2451). Pinned by digest so builds are reproducible;
+# bump it to pick up Chainguard's CVE fixes: crane digest cgr.dev/regsensus.com/conductor:v3.33.1
+ARG RUNTIME_BASE=cgr.dev/regsensus.com/conductor:v3.33.1@sha256:8b135149e6305fc6692659a75670d6024e551d2c6c7fb887e48e20133e815e08
+
 # ===========================================================================================================
 # 0. Builder stage
 # ===========================================================================================================
@@ -57,49 +61,17 @@ RUN if [ "$PREBUILT" = "false" ]; then \
 # ===========================================================================================================
 # 2. Final stage
 # ===========================================================================================================
-FROM debian:stable-slim
+# Runtime base is Chainguard's hardened conductor image (PP-2451). It is upstream
+# conductor-oss with the same layout this image always used (Java 21 JRE, nginx, sh,
+# /app/{libs,config}/, /app/startup.sh, UI in /usr/share/nginx/html), so we only swap
+# in our fork's server JAR, config, startup script and UI build. No OS packages are
+# installed here: CVE fixes come from rebuilding on a newer base digest (RUNTIME_BASE,
+# declared at the top of this file).
+FROM ${RUNTIME_BASE}
 
-LABEL maintainer="Orkes OSS <oss@orkes.io>"
-
-# nginx is pinned to a version patched against CVE-2026-42533 (map directive heap
-# buffer overflow) and CVE-2026-60005 (ngx_http_slice_module uninitialized memory
-# read). Bump this alongside Debian's nginx security tracker as new advisories land:
-# https://security-tracker.debian.org/tracker/source-package/nginx
-ARG NGINX_VERSION=1.26.3-3+deb13u8
-
-RUN apt-get update && apt-get upgrade -y --no-install-recommends \
-    && apt-get install -y --no-install-recommends openjdk-21-jre-headless nginx=${NGINX_VERSION} curl ca-certificates \
-    && rm -f /etc/nginx/sites-enabled/default \
-    && rm -rf /var/lib/apt/lists/*
-
-# TODO(remove): libacl1/libattr1 (pulled in transitively by coreutils/tar/sed/passwd)
-# are vulnerable to CVE-2026-54369 / CVE-2026-54370 / CVE-2026-54371
-# (symlink-traversal and TOCTOU flaws in pathname-based ACL/xattr functions)
-# below 2.4.0/2.6.0. Debian has NOT backported
-# fixed versions to trixie yet - the fix only exists in sid today because the
-# acl/attr CLI tools' ABI changes carry a regression risk the maintainers flagged.
-# Those CLI tools aren't installed in this image, and coreutils/tar/sed/passwd/nginx
-# have been smoke-tested clean against the sid versions, so this block pulls just
-# these two packages from sid, pinned to the fixed versions, without giving sid
-# priority over anything else.
-# >>> Remove this whole block (and switch libacl1/libattr1 back to the plain
-# >>> apt-get install line above) once trixie/trixie-security ships a fixed
-# >>> version - check before removing:
-# https://security-tracker.debian.org/tracker/CVE-2026-54369
-# https://security-tracker.debian.org/tracker/CVE-2026-54370
-# https://security-tracker.debian.org/tracker/CVE-2026-54371
-ARG LIBACL1_VERSION=2.4.0-1
-ARG LIBATTR1_VERSION=1:2.6.0-1
-
-RUN echo 'deb http://deb.debian.org/debian sid main' > /etc/apt/sources.list.d/sid.list \
-    && printf 'Package: *\nPin: release a=sid\nPin-Priority: 100\n' > /etc/apt/preferences.d/sid-pin \
-    && apt-get update \
-    && apt-get install -y -t sid --no-install-recommends libacl1=${LIBACL1_VERSION} libattr1=${LIBATTR1_VERSION} \
-    && rm -f /etc/apt/sources.list.d/sid.list /etc/apt/preferences.d/sid-pin \
-    && rm -rf /var/lib/apt/lists/*
-
-# Make app folders
-RUN mkdir -p /app/config /app/logs /app/libs
+# Drop upstream's JAR, config and UI so nothing from upstream conductor is left behind.
+RUN rm -rf /app/libs/* /app/config/* /usr/share/nginx/html/* \
+    && mkdir -p /app/config /app/logs /app/libs
 
 # Copy the compiled output to new image
 COPY docker/server/bin /app
@@ -108,14 +80,14 @@ COPY --from=builder /conductor/server/build/libs/*boot*.jar /app/libs/conductor-
 
 # Copy compiled UI assets to nginx www directory
 WORKDIR /usr/share/nginx/html
-RUN rm -rf ./*
 COPY --from=ui-builder /conductor/ui/build .
 COPY docker/server/nginx/nginx.conf  /etc/nginx/conf.d/default.conf
 
 # Copy the files for the server into the app folders
 RUN chmod +x /app/startup.sh
 
-HEALTHCHECK --interval=60s --timeout=30s --retries=10 CMD curl -I -XGET http://localhost:8080/health || exit 1
+# No HEALTHCHECK: the base image has no curl. Kubernetes uses the chart's httpGet
+# probes on /health instead.
 
 CMD [ "/app/startup.sh" ]
 ENTRYPOINT [ "/bin/sh"]
