@@ -72,7 +72,9 @@ RUN if [ "$PREBUILT" = "false" ]; then \
 FROM ${RUNTIME_BASE}
 
 # Drop upstream's JAR, config and UI so nothing from upstream conductor is left behind.
-RUN rm -rf /app/libs/* /app/config/* /usr/share/nginx/html/* \
+# The base's /app/libs/conductor-server.jar is only a symlink to /usr/share/java/conductor,
+# so remove that directory too, or scanners still report upstream's unused JAR.
+RUN rm -rf /app/libs/* /app/config/* /usr/share/nginx/html/* /usr/share/java/conductor \
     && mkdir -p /app/config /app/logs /app/libs
 
 # Copy the compiled output to new image

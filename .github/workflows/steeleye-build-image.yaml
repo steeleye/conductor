@@ -1,0 +1,147 @@
+name: SteelEye - Build conductor-oss image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish, without the arch suffix (e.g. 26.04-se.7 or 26.04-se.6-dev.02)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steeleye-build-image-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REGISTRY: 698897937809.dkr.ecr.eu-west-1.amazonaws.com
+  IMAGE: 698897937809.dkr.ecr.eu-west-1.amazonaws.com/conductor-oss
+  # Runtime base pulled from our ECR mirror of cgr.dev/regsensus.com/conductor (os-images
+  # public-to-ecr-and-acr.yaml), so this workflow needs no Chainguard credentials. The mirror
+  # copies the index unchanged, so the digest matches the cgr.dev one pinned in the Dockerfile.
+  # Keep both in step when bumping the base.
+  RUNTIME_BASE: 698897937809.dkr.ecr.eu-west-1.amazonaws.com/cgr.dev/conductor:v3.33.1@sha256:8b135149e6305fc6692659a75670d6024e551d2c6c7fb887e48e20133e815e08
+
+jobs:
+  check:
+    name: Check tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^[0-9]{2}\.[0-9]{2}-se\.[0-9]+(-dev\.[0-9]+)?$ ]]; then
+            echo "Tag '$TAG' does not look like 26.04-se.N or 26.04-se.N-dev.NN" >&2
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_PROD_ECR_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_PROD_ECR_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Refuse to overwrite existing tags
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          for t in "$TAG" "$TAG.arm64" "$TAG.amd64"; do
+            if aws ecr describe-images --repository-name conductor-oss --image-ids imageTag="$t" >/dev/null 2>&1; then
+              echo "conductor-oss:$t already exists in ECR; pick a new tag" >&2
+              exit 1
+            fi
+          done
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Native runners for each arch: the Gradle and UI builds are far too slow under QEMU.
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_PROD_ECR_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_PROD_ECR_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push ${{ matrix.arch }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/server/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          # Our cells index into Elasticsearch 8. The Dockerfile default (elasticsearch) bundles
+          # only the ES7 module, and the server then fails to start with no IndexDAO bean.
+          build-args: |
+            RUNTIME_BASE=${{ env.RUNTIME_BASE }}
+            INDEXING_BACKEND=elasticsearch8
+          push: true
+          provenance: true
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}.${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.tag }}
+
+  manifest:
+    name: Multi-arch tag
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_PROD_ECR_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_PROD_ECR_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create ${{ inputs.tag }} from the arch images
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$IMAGE:$TAG" \
+            "$IMAGE:$TAG.amd64" \
+            "$IMAGE:$TAG.arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+          {
+            echo "### Published conductor-oss:$TAG"
+            echo ""
+            echo "- \`$IMAGE:$TAG\` (amd64 + arm64)"
+            echo "- \`$IMAGE:$TAG.amd64\`"
+            echo "- \`$IMAGE:$TAG.arm64\`"
+            echo ""
+            echo "Built from \`${GITHUB_SHA}\` on \`${GITHUB_REF_NAME}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
