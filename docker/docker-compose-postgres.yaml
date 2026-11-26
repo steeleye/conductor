@@ -22,7 +22,8 @@ services:
       - 8000:8080
       - 8127:5000
     healthcheck:
-      test: [ "CMD", "curl","-I" ,"-XGET", "http://localhost:8080/health" ]
+      # The image has no curl/wget; bash's /dev/tcp sends the request and the status line must be 200.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$$code\" = 200 ]"]
       interval: 60s
       timeout: 30s
       retries: 12
