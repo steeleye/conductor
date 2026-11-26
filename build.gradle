@@ -27,7 +27,7 @@ plugins {
 // Establish version and status
 ext.githubProjectName = rootProject.name // Change if github project name is not the same as the root project's name
 
-ext["tomcat.version"] = "10.1.54"
+ext["tomcat.version"] = "10.1.61"
 
 subprojects {
     tasks.withType(Javadoc).all { enabled = false }
@@ -60,11 +60,17 @@ allprojects {
             exclude group: 'ch.qos.logback', module: 'logback-core'
             exclude group: 'org.apache.logging.log4j', module: 'log4j-to-slf4j'
             exclude group: 'org.slf4j', module: 'slf4j-log4j12'
+            // spring-jcl replaces commons-logging; having both prints a classpath conflict warning at startup.
+            exclude group: 'commons-logging', module: 'commons-logging'
 
             resolutionStrategy.eachDependency { details ->
                 // Compat: align all com.fasterxml.jackson.* to the same version — mixed versions cause ClassNotFoundException
                 if (details.requested.group.startsWith('com.fasterxml.jackson.')) {
-                    details.useVersion "2.18.8"
+                    details.useVersion "2.18.11"
+                }
+                // CVE fix: transitive jsoup 1.15.4 is vulnerable.
+                if (details.requested.group == 'org.jsoup' && details.requested.name == 'jsoup') {
+                    details.useVersion "1.23.2"
                 }
                 // Compat: Spring Boot 3.5 requires HttpClient 5.4+ for TlsSocketStrategy.
                 if (details.requested.group == 'org.apache.httpcomponents.client5'

@@ -13,7 +13,7 @@
 FROM azul/zulu-openjdk-debian:21 AS builder
 
 ARG PREBUILT=false
-ARG INDEXING_BACKEND=elasticsearch
+ARG INDEXING_BACKEND=elasticsearch8
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
@@ -35,7 +35,7 @@ RUN if [ "$PREBUILT" = "true" ]; then \
 # ===========================================================================================================
 # 1. UI builder stage
 # ===========================================================================================================
-FROM node:lts AS ui-builder
+FROM node:24 AS ui-builder
 
 ARG PREBUILT=false
 ARG SKIP_UI=false
@@ -62,13 +62,20 @@ FROM debian:stable-slim
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
+# Upgrade base packages to pick up security fixes.
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends openjdk-21-jre-headless nginx curl ca-certificates \
     && rm -f /etc/nginx/sites-enabled/default \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt/* /var/log/dpkg.log
 
 # Make app folders
 RUN mkdir -p /app/config /app/logs /app/libs
+
+# The chart runs the container as a non-root user, so let nginx and the startup script write their pid, temp and log files.
+RUN sed -i -e '/^user /d' -e 's#^pid .*#pid /tmp/nginx.pid;#' /etc/nginx/nginx.conf \
+    && chmod -R a+rwX /var/lib/nginx /var/log/nginx /app/logs
 
 # Copy the compiled output to new image
 COPY docker/server/bin /app
