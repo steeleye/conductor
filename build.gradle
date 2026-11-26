@@ -66,11 +66,23 @@ allprojects {
             resolutionStrategy.eachDependency { details ->
                 // Compat: align all com.fasterxml.jackson.* to the same version — mixed versions cause ClassNotFoundException
                 if (details.requested.group.startsWith('com.fasterxml.jackson.')) {
-                    details.useVersion "2.18.11"
+                    details.useVersion "2.18.12"
                 }
                 // CVE fix: transitive jsoup 1.15.4 is vulnerable.
                 if (details.requested.group == 'org.jsoup' && details.requested.name == 'jsoup') {
                     details.useVersion "1.23.2"
+                }
+                // CVE fix: Bouncy Castle 1.78.1 certificate validation issues. Keep the jdk18on modules aligned.
+                if (details.requested.group == 'org.bouncycastle' && details.requested.name.endsWith('-jdk18on')) {
+                    details.useVersion "1.87"
+                }
+                // CVE fix: PostgreSQL JDBC driver 42.7.11 → 42.7.12 (patch release).
+                if (details.requested.group == 'org.postgresql' && details.requested.name == 'postgresql') {
+                    details.useVersion "42.7.12"
+                }
+                // CVE fix: snappy-java 1.1.10.5 → 1.1.10.9.
+                if (details.requested.group == 'org.xerial.snappy' && details.requested.name == 'snappy-java') {
+                    details.useVersion "1.1.10.9"
                 }
                 // Compat: Spring Boot 3.5 requires HttpClient 5.4+ for TlsSocketStrategy.
                 if (details.requested.group == 'org.apache.httpcomponents.client5'
