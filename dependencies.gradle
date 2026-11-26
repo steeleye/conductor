@@ -59,7 +59,8 @@ ext {
     // a stable 2.x (Jackson 3) lands on Maven Central.
     revJq = '2.0.0-alpha1'
     revMockServerClient = '5.12.0'
-    revSpringDoc = '3.1.0'
+    // Security: 3.1.0 has a DoS issue in springdoc-openapi-starter-common; 3.1.1 fixes it.
+    revSpringDoc = '3.1.1'
     revOrkesQueues = '2.0.0.rc4'
     revProtogenAnnotations = '1.0.0'
     revProtogenCodegen = '1.4.0'
@@ -82,7 +83,8 @@ ext {
     revStan = '2.2.3'
     revConductorClient = '5.0.1'
     revReactor = '1.3.1'
-    revSpringAI = '2.0.1'
+    // Security: 2.0.1 has a DoS issue in spring-ai-commons; 2.0.3 fixes it.
+    revSpringAI = '2.0.3'
     revJSonSchemaValidator  = '3.0.7'
     mongodb = '4.11.0'
     pgVector = '0.1.4'

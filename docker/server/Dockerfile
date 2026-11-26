@@ -8,7 +8,13 @@
 #
 
 # The builder stages below run on Debian + Temurin 25 (JDK). The shipped runtime (final stage)
-# runs on the Alpine Temurin 25 JRE pinned to the same 25.0.5+8 release.
+# runs on Chainguard's JRE 25.
+# Runtime for the shipped image: Chainguard's distroless JRE 25 (glibc, no shell, no package manager),
+# plus busybox and nginx added as real apk packages (see the runtime-rootfs stage below).
+# RUNTIME_DEV must be the -dev variant of the SAME JRE release; it is only used to run apk at build time.
+ARG RUNTIME_BASE=cgr.dev/regsensus.com/jre:openjdk-25.0.5.1-headless@sha256:6870e2d57e6c72f3263b50b5e665fc6b2ce6b1143cf036d41d478b1f9ba4cac3
+ARG RUNTIME_DEV=cgr.dev/regsensus.com/jre:openjdk-25.0.5.1-r2-headless-dev@sha256:d0adc8a707740af4b5e43440fc87c55f3f075f87a1e0aa48552af1ef774f1d22
+
 FROM debian:trixie-slim AS java-base
 
 ARG TEMURIN_VERSION=25.0.5.0.0+8-0
@@ -77,60 +83,65 @@ RUN if [ "$SKIP_UI" = "true" ]; then \
     fi
 
 # ===========================================================================================================
-# 2. Final stage
+# 2. Runtime root filesystem: distroless JRE + busybox + nginx
 # ===========================================================================================================
-# Alpine base to shed the OS-level CVEs that debian:stable-slim carried: perl
-# (CVE-2026-13221 / CVE-2026-57432), libssh2 (CVE-2026-58050), and an nginx that debian-slim
-# could not patch past 1.26.3 (CVE-2026-60005). The temurin JRE ships in the base image, so the
-# only package we add is nginx. The healthcheck uses busybox wget (built in) instead of curl,
-# which also removes curl's libcurl/libssh2 chain from the image entirely.
+# The distroless JRE has no shell or package manager, so packages cannot be added to it directly.
+# Instead its whole filesystem (including its apk package database) is copied into /rootfs of the
+# matching -dev image, and apk installs busybox (for startup.sh) and nginx (for the UI) into that
+# root. The package database stays accurate, so image scanners still see every package and version.
 #
-# Floating 25-jre-alpine tag so each rebuild picks up the latest 25.x JVM patch and Alpine
-# package updates automatically -- the point of this image is to stay current on OS/JVM CVEs.
-# The builder stage pins its JDK for a reproducible bytecode target; the shipped runtime does not
-# need to match that patch level (it only runs the compiled jar), so the two can drift.
-FROM eclipse-temurin:25-jre-alpine AS runtime
+# --no-scripts: glibc's ldconfig trigger cannot run inside the distroless root (it has no ldconfig).
+# The two script steps that matter are done by hand instead: busybox's applet symlinks (its only
+# trigger) and the dynamic-linker cache, rebuilt with the -dev image's own ldconfig (same glibc).
+# nginx-stable-config is named explicitly; otherwise apk may pick an unrelated nginx-config provider.
+FROM ${RUNTIME_BASE} AS runtime-base
+
+FROM ${RUNTIME_DEV} AS runtime-rootfs
+USER root
+COPY --from=runtime-base / /rootfs/
+RUN mkdir -p /rootfs/etc/apk/keys \
+    && cp /etc/apk/keys/* /rootfs/etc/apk/keys/ \
+    && cp /etc/apk/repositories /rootfs/etc/apk/repositories \
+    && apk add --root /rootfs --arch "$(apk --print-arch)" --no-cache --no-scripts \
+         busybox nginx-stable nginx-stable-config \
+    && chroot /rootfs /usr/bin/busybox --install -s \
+    && ldconfig -r /rootfs \
+    && rm -rf /rootfs/etc/apk/repositories /rootfs/etc/apk/keys \
+    && rm -f /rootfs/etc/nginx/conf.d/*.conf \
+    && mkdir -p /rootfs/app/config /rootfs/app/libs /rootfs/app/logs /rootfs/usr/share/nginx/html \
+    && chown 65532:65532 /rootfs/app/logs /rootfs/var/lib/nginx/logs /rootfs/var/lib/nginx/tmp
+
+# ===========================================================================================================
+# 3. Final stage: server + UI in one container
+# ===========================================================================================================
+# Same contract as before: /bin/sh /app/startup.sh starts nginx (UI on 5000) and the server (8080),
+# configured with CONFIG_PROP and JAVA_OPTS. Runs as the non-root Chainguard user (65532).
+FROM scratch AS final
 
 LABEL maintainer="Orkes OSS <oss@orkes.io>"
 
-# nginx floor pinned above 1.30.6-r0: that build carried CVE-2026-113425 / -121810 / -123007 /
-# -123633 / -123634 (all mail-proxy or HTTP/2-proxy paths, none of which this image's config uses,
-# so real exposure is nil -- the floor just keeps a rebuild from silently regressing onto it).
-# The 25-jre-alpine base (Alpine 3.24) ships the fixed 1.30.7-r0, so a rebuild picks it up.
-RUN apk add --no-cache "nginx>1.30.6-r0" ca-certificates \
-    && rm -f /etc/nginx/http.d/default.conf \
-    && mkdir -p /run/nginx
+COPY --from=runtime-rootfs /rootfs/ /
 
-# DO NOT REMOVE WHILE WE ARE RUNNING ALPINE!
-# grpc-java (bundled via conductor-grpc-server) is not officially supported on Alpine/musl and
-# recommends a glibc-based image. Its native netty bits can segfault the JVM at load time under
-# musl. gcompat + libunwind provide the glibc-compat shims; startup.sh LD_PRELOADs them around the
-# java invocation only (not nginx/busybox). Without these packages the preload paths would not
-# exist and the dynamic loader would error.
-RUN apk add --no-cache gcompat libunwind
+# Environment of the Chainguard JRE image (lost with FROM scratch).
+ENV JAVA_HOME=/usr/lib/jvm/default-jvm \
+    LANG=en_US.UTF-8 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-FROM runtime AS final
-
-# Make app folders
-RUN mkdir -p /app/config /app/logs /app/libs
-
-# Copy the compiled output to new image
-COPY docker/server/bin /app
+COPY --chmod=0755 docker/server/bin/startup.sh /app/startup.sh
 COPY docker/server/config /app/config
 COPY --from=builder /conductor/server/build/libs/*boot*.jar /app/libs/conductor-server.jar
 
-# Copy compiled UI assets to nginx www directory
-WORKDIR /usr/share/nginx/html
-RUN rm -rf ./*
-COPY --from=ui-builder /conductor/ui-next/dist .
-COPY docker/server/nginx/nginx.conf  /etc/nginx/http.d/default.conf
+COPY --from=ui-builder /conductor/ui-next/dist /usr/share/nginx/html
+COPY docker/server/nginx/nginx.main.conf /etc/nginx/nginx.conf
+COPY docker/server/nginx/nginx.conf /etc/nginx/conf.d/default.conf
 
-# Copy the files for the server into the app folders
-RUN chmod +x /app/startup.sh
+USER 65532
+WORKDIR /app
+EXPOSE 8080 5000
 
-# Uses 127.0.0.1 (not localhost): busybox wget resolves localhost to ::1 first and does not fall
-# back to IPv4 the way curl did, so localhost would fail against the IPv4-bound server.
-HEALTHCHECK --interval=60s --timeout=30s --retries=10 CMD wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1
+# No HEALTHCHECK: Chainguard's busybox has no wget/nc and curl is not installed. Kubernetes ignores
+# HEALTHCHECK and uses its own httpGet probes on /health.
 
-CMD [ "/app/startup.sh" ]
-ENTRYPOINT [ "/bin/sh"]
+ENTRYPOINT ["/bin/sh"]
+CMD ["/app/startup.sh"]

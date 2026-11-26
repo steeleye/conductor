@@ -24,11 +24,7 @@ nginx
 cd /app/libs
 echo "Using java options config: $JAVA_OPTS"
 
-# Alpine/musl: preload the glibc-compat shims (gcompat + libunwind, installed in the Dockerfile)
-# so grpc-java's native netty bits don't segfault the JVM at load time. Scoped to the java process
-# here — set after nginx has already started so nginx/busybox stay on native musl.
-# DO NOT REMOVE WHILE WE ARE RUNNING ALPINE! (see Dockerfile for context)
-export LD_PRELOAD=/lib/libgcompat.so.0:/usr/lib/libunwind.so.8
+# The runtime is glibc-based (Chainguard), so the Alpine gcompat/libunwind LD_PRELOAD is not needed.
 
 if [ -z "$CONFIG_PROP" ];
   then
